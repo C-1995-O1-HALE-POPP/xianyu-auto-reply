@@ -15,6 +15,7 @@ import os
 import sys
 import aiohttp
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Dict, Optional
 from loguru import logger
 
@@ -46,46 +47,59 @@ DEFAULT_HEADERS = {
 
 WEBSOCKET_HEADERS = {}
 
+ORDER_STAGE_MESSAGES = {
+    "[我已拍下，待付款]": ("purchase", "pending_payment"),
+    "[我已付款，等待你发货]": ("paid", "pending_ship"),
+    "[买家已付款]": ("paid", "pending_ship"),
+    "[付款完成]": ("paid", "pending_ship"),
+    "[已付款，待发货]": ("paid", "pending_ship"),
+}
+
+ORDER_STAGE_LABELS = {
+    "purchase": "拍下回复",
+    "paid": "付款回复",
+}
+
 
 class XianyuAsync:
     """闲鱼WebSocket客户端核心类"""
-    
+
     # 类级别的实例管理字典
     _instances = {}
     _instances_lock = asyncio.Lock()
-    
+
     # 类级别的密码登录时间记录
     _last_password_login_time = {}
     _password_login_cooldown = 60
-    
+
     # 账密错误冷却记录
     _password_error_cooldown_time = {}
     _password_error_cooldown = 5 * 60 * 60
-    
+
     def __init__(self, cookies_str: str = None, cookie_id: str = "default", user_id: int = None):
         """
         初始化XianyuAsync实例
-        
+
         Args:
             cookies_str: Cookie字符串
             cookie_id: 账号唯一标识
             user_id: 用户ID
         """
         logger.info(f"【{cookie_id}】开始初始化XianyuAsync...")
-        
+
         if not cookies_str:
             raise ValueError("未提供cookies")
-        
+
         # 解析cookies
         logger.info(f"【{cookie_id}】解析cookies...")
         self.cookies = trans_cookies(cookies_str)
         logger.info(f"【{cookie_id}】cookies解析完成,包含字段: {list(self.cookies.keys())}")
-        
+
         self.cookie_id = cookie_id
         self.cookies_str = cookies_str
         self.user_id = user_id
         self.base_url = WEBSOCKET_URL
-        
+
         # 验证必需字段
         if 'unb' not in self.cookies:
             # 禁用账号
@@ -96,31 +110,31 @@ class XianyuAsync:
             except Exception as e:
                 logger.error(f"【{cookie_id}】禁用账号失败: {e}")
             raise ValueError(f"【{cookie_id}】Cookie中缺少必需的'unb'字段")
-        
+
         self.myid = self.cookies['unb']
         logger.info(f"【{cookie_id}】用户ID: {self.myid}")
         self.device_id = generate_device_id(self.myid)
-        
+
         # 心跳配置
         self.heartbeat_interval = HEARTBEAT_INTERVAL
         self.heartbeat_timeout = HEARTBEAT_TIMEOUT
-        
+
         # Token配置
         self.token_refresh_interval = TOKEN_REFRESH_INTERVAL
         self.token_retry_interval = TOKEN_RETRY_INTERVAL
         self.current_token = None
         self.last_token_refresh_time = 0  # 最后Token刷新时间
-        
+
         # 代理配置
         self.proxy_config = self._default_proxy_config()
-        
+
         # 后台任务
         self.heartbeat_task = None
         self.token_refresh_task = None
         self.cleanup_task = None
         self.cookie_refresh_task = None
         self.background_tasks = set()
-        
+
         # 消息处理并发控制
         self.message_semaphore = asyncio.Semaphore(100)
         self.active_message_tasks = 0
@@ -129,31 +143,31 @@ class XianyuAsync:
         # key: mid（客户端发送时生成），value: asyncio.Future（消息循环收到响应时 set_result）
         # 用于 /r/SingleChatConversation/create 等需要拿响应结果的请求
         self._pending_mid_futures: Dict[str, asyncio.Future] = {}
-        
+
         # Session
         self.session = None
-        
+
         # 初始化连接管理器
         self.connection_manager = ConnectionManager(self)
-        
+
         # 初始化Token管理器
         self.token_manager = TokenManager(self)
-        
+
         # 初始化Cookie/Token管理器（处理滑块验证等复杂逻辑）
         from app.services.xianyu.cookie_token_manager import CookieTokenManager
         self._cookie_token_manager = CookieTokenManager(self)
-        
+
         # 初始化通知管理器
         from app.services.xianyu.notification_manager import NotificationManager
         self._notification_manager = NotificationManager(self.cookie_id)
-        
+
         # 添加缺失的属性（CookieTokenManager需要）
         self.last_token_refresh_status = "not_started"
         self.max_captcha_verification_count = 3
         self.last_message_received_time = 0
         self.message_cookie_refresh_cooldown = 300
         self.restarted_in_browser_refresh = False
-        
+
         # 自动发货相关属性（AutoDeliveryHandler需要）
         self.delivery_sent_orders = {}  # 已发货订单字典 {order_id: timestamp}（防重复发货，支持清理）
         self.last_delivery_time = {}  # 最后发货时间字典 {order_id: timestamp}
@@ -165,14 +179,14 @@ class XianyuAsync:
         self.order_confirm_cooldown = 300  # 确认发货冷却时间（秒）
         self.yifan_account_lock = asyncio.Lock()  # 亦凡账号锁
         self.yifan_account_waiting = False  # 亦凡账号等待状态
-        
+
         # 初始化自动发货处理器
         from app.services.xianyu.auto_delivery_handler import AutoDeliveryHandler
         self.auto_delivery_handler = AutoDeliveryHandler(self)
-        
+
         # 注册实例
         self._register_instance()
-        
+
         logger.info(f"【{cookie_id}】XianyuAsync初始化完成")
 
     def _default_proxy_config(self) -> dict:
@@ -223,7 +237,7 @@ class XianyuAsync:
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】加载账号运行配置失败: {e}")
             return None
-    
+
     def _load_proxy_config(self) -> dict:
         """从数据库加载代理配置"""
         try:
@@ -240,7 +254,7 @@ class XianyuAsync:
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】加载代理配置失败: {e}")
             return self._default_proxy_config()
-    
+
     def _get_proxy_url(self) -> Optional[str]:
         """根据 self.proxy_config 拼代理 URL（HTTP 出站 + WebSocket 共用）
 
@@ -360,12 +374,12 @@ class XianyuAsync:
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】代理 API 调用异常: {e}，本次直连")
             return None
-    
+
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep"""
         chunk_size = 1.0
         remaining = duration
-        
+
         while remaining > 0:
             sleep_time = min(chunk_size, remaining)
             try:
@@ -373,7 +387,7 @@ class XianyuAsync:
                 remaining -= sleep_time
             except asyncio.CancelledError:
                 raise
-    
+
     def _register_instance(self):
         """注册实例到全局字典"""
         try:
@@ -381,7 +395,7 @@ class XianyuAsync:
             logger.info(f"【{self.cookie_id}】实例已注册到全局字典")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注册实例失败: {e}")
-    
+
     def _unregister_instance(self):
         """从全局字典注销实例"""
         try:
@@ -390,22 +404,22 @@ class XianyuAsync:
                 logger.info(f"【{self.cookie_id}】实例已从全局字典注销")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】注销实例失败: {e}")
-    
+
     @classmethod
     def get_instance(cls, cookie_id: str):
         """获取指定cookie_id的实例"""
         return cls._instances.get(cookie_id)
-    
+
     @classmethod
     def get_all_instances(cls):
         """获取所有活跃实例"""
         return dict(cls._instances)
-    
+
     @classmethod
     def get_instance_count(cls):
         """获取当前活跃实例数量"""
         return len(cls._instances)
-    
+
     def _build_session_connector(self):
         """根据当前 self.proxy_config 构造 aiohttp 的 connector
 
@@ -467,27 +481,27 @@ class XianyuAsync:
             )
             # 记录当前 session 绑定的代理 URL，用于检测代理变化时重建 session
             self._current_session_proxy_url = self._get_proxy_url()
-    
+
     async def close_session(self):
         """关闭aiohttp session"""
         if self.session:
             await self.session.close()
             self.session = None
-    
+
     async def refresh_token(self, captcha_retry_count: int = 0):
         """
         刷新token（委托给CookieTokenManager处理，包含滑块验证逻辑）
-        
+
         Args:
             captcha_retry_count: 滑块验证重试次数
-            
+
         Returns:
             新的token或None
         """
         return await self._cookie_token_manager.refresh_token(captcha_retry_count)
-    
+
     async def send_token_refresh_notification(self, error_message: str, notification_type: str = "token_refresh",
-                                             chat_id: str = None, attachment_path: str = None, 
+                                             chat_id: str = None, attachment_path: str = None,
                                              verification_url: str = None):
         """发送Token刷新异常通知"""
         try:
@@ -504,20 +518,20 @@ class XianyuAsync:
                 )
         except Exception as e:
             logger.error(f"【{self.cookie_id}】发送Token刷新通知失败: {self._safe_str(e)}")
-    
+
     async def restart_instance(self, reason: str = None):
         """重启实例的公开方法（供 CookieTokenManager 调用）
-        
+
         Args:
             reason: 重启原因，用于日志记录
         """
         if reason:
             logger.info(f"【{self.cookie_id}】重启原因: {reason}")
         await self._restart_instance()
-    
+
     async def _restart_instance(self):
         """重启XianyuLive实例
-        
+
         ⚠️ 注意：此方法会触发当前任务被取消！
         调用此方法后，当前任务会立即被 CookieManager 取消，
         因此不要在此方法后执行任何重要操作。
@@ -530,7 +544,7 @@ class XianyuAsync:
 
             if cookie_manager:
                 logger.info(f"【{self.cookie_id}】通过CookieManager重启实例...")
-                
+
                 # 使用 asyncio 调度重启，避免线程问题
                 async def delayed_restart():
                     """延迟重启，给当前任务时间清理"""
@@ -542,27 +556,27 @@ class XianyuAsync:
                         logger.info(f"【{self.cookie_id}】实例重启请求已触发")
                     except Exception as e:
                         logger.error(f"【{self.cookie_id}】触发实例重启失败: {e}")
-                
+
                 # 创建后台任务，不等待它完成
                 asyncio.create_task(delayed_restart())
-                
+
                 logger.info(f"【{self.cookie_id}】实例重启已调度，当前任务即将退出...")
                 logger.warning(f"【{self.cookie_id}】注意：重启请求已调度，CookieManager将在2秒后取消当前任务并启动新实例")
-                    
+
             else:
                 logger.warning(f"【{self.cookie_id}】CookieManager不可用，无法重启实例")
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】重启实例失败: {self._safe_str(e)}")
-    
+
     def _safe_str(self, obj):
         """安全地将对象转换为字符串（委托公共实现）"""
         return safe_str(obj)
-    
+
     async def init(self, ws):
         """
         初始化WebSocket连接
-        
+
         Args:
             ws: WebSocket连接对象
         """
@@ -570,11 +584,11 @@ class XianyuAsync:
         if not self.current_token:
             logger.info(f"【{self.cookie_id}】获取初始token...")
             await self.refresh_token()
-        
+
         if not self.current_token:
             logger.warning(f"【{self.cookie_id}】无法获取有效token")
             raise Exception("Token获取失败")
-        
+
         # 发送注册消息
         msg = {
             "lwp": "/reg",
@@ -592,7 +606,7 @@ class XianyuAsync:
         }
         await ws.send(json.dumps(msg))
         await asyncio.sleep(1)
-        
+
         # 发送同步状态消息
         current_time = int(time.time() * 1000)
         msg = {
@@ -613,22 +627,22 @@ class XianyuAsync:
         }
         await ws.send(json.dumps(msg))
         logger.info(f'【{self.cookie_id}】连接注册完成')
-    
+
     def _create_tracked_task(self, coro):
         """创建并追踪后台任务，确保异常不会被静默忽略"""
         task = asyncio.create_task(coro)
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
         return task
-    
+
     def _reset_background_tasks(self):
         """直接重置后台任务引用，不等待取消（用于快速重连）
-        
+
         注意：只重置心跳任务，因为只有心跳任务依赖WebSocket连接。
         其他任务（Token刷新、清理、Cookie刷新）不依赖WebSocket，可以继续运行。
         """
         logger.info(f"【{self.cookie_id}】准备重置后台任务引用（仅重置依赖WebSocket的任务）...")
-        
+
         # 只处理心跳任务（依赖WebSocket，需要重启）
         if self.heartbeat_task:
             status = "已完成" if self.heartbeat_task.done() else "运行中"
@@ -645,7 +659,7 @@ class XianyuAsync:
             logger.info(f"【{self.cookie_id}】心跳任务引用已重置")
         else:
             logger.info(f"【{self.cookie_id}】没有心跳任务需要重置")
-        
+
         # 检查其他任务的状态（这些任务不依赖WebSocket，不需要重启）
         other_tasks_status = []
         if self.token_refresh_task:
@@ -657,14 +671,14 @@ class XianyuAsync:
         if self.cookie_refresh_task:
             status = "已完成" if self.cookie_refresh_task.done() else "运行中"
             other_tasks_status.append(f"Cookie刷新任务({status})")
-        
+
         if other_tasks_status:
             logger.info(f"【{self.cookie_id}】其他任务继续运行（不依赖WebSocket）: {', '.join(other_tasks_status)}")
         else:
             logger.info(f"【{self.cookie_id}】没有其他任务在运行")
-        
+
         logger.info(f"【{self.cookie_id}】任务重置完成，可以立即创建新的心跳任务")
-    
+
     async def _handle_message_with_semaphore(self, message_data: dict, websocket):
         """带信号量的消息处理包装器，防止并发任务过多"""
         async with self.message_semaphore:
@@ -676,11 +690,11 @@ class XianyuAsync:
                 # 定期记录活跃任务数（每100个任务记录一次）
                 if self.active_message_tasks % 100 == 0 and self.active_message_tasks > 0:
                     logger.info(f"【{self.cookie_id}】当前活跃消息处理任务数: {self.active_message_tasks}")
-    
+
     async def handle_message(self, message_data: dict, websocket):
         """
         处理接收到的消息
-        
+
         Args:
             message_data: 消息数据
             websocket: WebSocket连接
@@ -690,29 +704,31 @@ class XianyuAsync:
             if not hasattr(self, 'message_handler'):
                 from app.services.xianyu.message_handler import MessageHandler
                 self.message_handler = MessageHandler(self.cookie_id, self.myid)
-                
+
                 # 设置消息处理回调
                 from app.services.xianyu.auto_reply_service import AutoReplyService
                 auto_reply_service = AutoReplyService(self.cookie_id, self)
-                
+
                 async def on_chat_message(parsed_message, ws):
                     """处理聊天消息
-                    
+
                     处理流程（参照旧框架message_handler_core.py）：
                     0. 检查自己发出的消息是否包含重发货触发关键字 -> 提取订单号触发自动发货
                     1. 处理订单状态（付款消息时异步获取订单详情）
                     2. 检查评价请求消息 -> 触发自动评价流程（同时触发确认收货消息）
                     3. 检查自动发货触发消息 -> 触发自动发货流程
                     4. 其他消息 -> 交给auto_reply_service处理自动回复
-                    
+
                     注意：确认收货消息不单独处理，由评价请求消息统一触发，避免重复发送
                     """
                     send_message = parsed_message.get("send_message", "")
                     raw_message = parsed_message.get("raw_message", {})
                     item_id = parsed_message.get("item_id", "")
                     send_user_id = parsed_message.get("send_user_id", "")
+                    send_user_name = parsed_message.get("send_user_name", "")
+                    chat_id = parsed_message.get("chat_id", "")
                     msg_time = parsed_message.get("msg_time", "")
-                    
+
                     # 0. 检查是否是自己发出的消息，且包含重发货触发关键字
                     myid = getattr(self, 'myid', self.cookie_id)
                     if send_user_id == myid and send_message:
@@ -729,7 +745,7 @@ class XianyuAsync:
                                     if remaining and remaining.isdigit():
                                         order_no = remaining
                                         logger.info(f"【{self.cookie_id}】✅ 检测到重发货触发: 关键词='{redelivery_keyword}', 订单号={order_no}")
-                                        
+
                                         # 从数据库查询订单信息
                                         order_info = db_manager.get_order_by_id(order_no)
                                         if not order_info:
@@ -746,7 +762,7 @@ class XianyuAsync:
                                                 )
                                             except Exception as insert_e:
                                                 logger.warning(f"【{self.cookie_id}】重发货触发: 创建订单记录失败: {insert_e}")
-                                        
+
                                         # 无论订单是否已存在，都通过API刷新订单详情（补充item_id/buyer_id/is_bargain等）
                                         try:
                                             from common.services.order_service import OrderDetailService
@@ -754,16 +770,16 @@ class XianyuAsync:
                                             await order_detail_service.fetch_and_update_order_detail(order_id=order_no)
                                         except Exception as fetch_e:
                                             logger.warning(f"【{self.cookie_id}】重发货触发: API刷新订单 {order_no} 详情失败: {fetch_e}")
-                                        
+
                                         # 重新获取最新的订单信息
                                         order_info = db_manager.get_order_by_id(order_no)
                                         logger.info(f"【{self.cookie_id}】重发货触发: 订单 {order_no} get_order_by_id 完整返回结果: {order_info}")
-                                        
+
                                         if order_info:
                                             order_item_id = order_info.get('item_id', '') or item_id
                                             order_buyer_id = order_info.get('buyer_id', '')
                                             order_chat_id = order_info.get('chat_id', '') or parsed_message.get('chat_id', '')
-                                            
+
                                             if hasattr(self, 'auto_delivery_handler') and self.auto_delivery_handler:
                                                 # 关键防护：在调 pre_check 之前先做 item 归属检查
                                                 # 因为重发货关键字的 order_no 来自卖家手动输入，
@@ -856,11 +872,43 @@ class XianyuAsync:
                                         logger.info(f"【{self.cookie_id}】重发货触发: 去除关键词后剩余内容'{remaining}'不是纯数字订单号，忽略")
                         except Exception as e:
                             logger.warning(f"【{self.cookie_id}】重发货触发关键字检查异常: {e}")
-                    
+
                     # 处理订单状态（参照旧框架_process_order_status_handler）
                     # 如果是付款相关消息，异步获取订单详情
                     await self._process_order_status(raw_message, send_message, item_id, send_user_id, msg_time)
-                    
+
+                    # ========== 订单阶段回复触发：拍下 / 付款 ==========
+                    stage_info = ORDER_STAGE_MESSAGES.get(send_message)
+                    if stage_info:
+                        stage, order_status = stage_info
+                        order_id = self._extract_order_id(raw_message)
+                        if order_id:
+                            logger.info(
+                                f"【{self.cookie_id}】📋 检测到{ORDER_STAGE_LABELS.get(stage, stage)}消息: "
+                                f"order_id={order_id}"
+                            )
+                            if stage == "purchase":
+                                asyncio.create_task(self._execute_order_price_adjustment(
+                                    order_id=order_id,
+                                    order_status=order_status,
+                                    item_id=item_id,
+                                    buyer_id=send_user_id,
+                                    buyer_name=send_user_name,
+                                    chat_id=chat_id,
+                                ))
+                            await self._execute_order_stage_reply(
+                                stage=stage,
+                                order_id=order_id,
+                                order_status=order_status,
+                                item_id=item_id,
+                                buyer_id=send_user_id,
+                                buyer_name=send_user_name,
+                                chat_id=chat_id,
+                                source_message=send_message,
+                                ws=ws,
+                            )
+                        # 不return，继续走后续流程（评价检查、发货等）
+
                     # 检查是否是评价请求消息（参照旧框架）
                     # 注意：评价消息优先级最高，必须先检查
                     if auto_reply_service.is_rate_request_message(send_message):
@@ -868,7 +916,7 @@ class XianyuAsync:
                         # 调用自动评价处理
                         await self._handle_rate_request_message(parsed_message, ws)
                         return
-                    
+
                     # 检查是否是自动发货触发消息（参照旧框架）
                     if auto_reply_service.is_auto_delivery_trigger(send_message):
                         # 检查是否启用自动确认发货
@@ -881,26 +929,26 @@ class XianyuAsync:
                         # 自动发货消息不进行自动回复，但仍然发送通知
                         # auto_reply_service.handle_chat_message 中已经处理了通知发送
                         return
-                    
+
                     # 确认收货消息不单独处理，由评价请求消息统一触发确认收货回复
                     # 因为系统会在确认收货后紧接着发送评价请求消息，避免重复触发
-                    
+
                     # 其他消息交给auto_reply_service处理
                     await auto_reply_service.handle_chat_message(parsed_message, ws)
-                
+
                 self.message_handler.set_chat_message_handler(on_chat_message)
-                
+
                 # 设置卡片消息处理回调（参照旧框架，用于检测小刀等）
                 async def on_card_message(parsed_message, ws):
                     """处理卡片消息（小刀等）"""
                     await self._handle_card_message(parsed_message, ws)
-                
+
                 self.message_handler.set_card_message_handler(on_card_message)
-                
+
                 # 设置卡片更新消息处理回调（如付款状态变更，message["1"]为字符串的特殊格式）
                 async def on_card_update_message(parsed_message, ws):
                     """处理卡片更新消息（付款状态变更等）
-                    
+
                     处理流程：
                     1. 获取订单详情
                     2. 检查是否触发自动发货
@@ -910,10 +958,10 @@ class XianyuAsync:
                     item_id = parsed_message.get("item_id", "")
                     send_user_id = parsed_message.get("send_user_id", "")
                     msg_time = parsed_message.get("msg_time", "")
-                    
+
                     # 处理订单状态（获取订单详情）
                     await self._process_order_status(raw_message, send_message, item_id, send_user_id, msg_time)
-                    
+
                     # 检查是否是自动发货触发消息
                     if auto_reply_service.is_auto_delivery_trigger(send_message):
                         if self.is_auto_confirm_enabled():
@@ -925,27 +973,27 @@ class XianyuAsync:
                         # 非发货触发的卡片更新消息（如"买家已拍下，待付款"等），交给auto_reply_service处理自动回复
                         logger.info(f"【{self.cookie_id}】卡片更新消息触发自动回复: {send_message}")
                         await auto_reply_service.handle_chat_message(parsed_message, ws)
-                
+
                 self.message_handler.set_card_update_message_handler(on_card_update_message)
-            
+
             # 处理消息
             await self.message_handler.handle_message(message_data, websocket)
-            
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理消息异常: {e}")
-    
+
     async def pause_cleanup_loop(self):
         """定期清理过期的暂停记录、锁和缓存（防止内存泄漏）"""
         try:
             while True:
                 try:
                     current_time = time.time()
-                    
+
                     # 清理过期的暂停记录
                     from app.services.xianyu.resource_manager import pause_manager
                     pause_manager.cleanup_expired_pauses()
                     await asyncio.sleep(0)
-                    
+
                     # 清理过期的消息锁（超过1小时的锁）
                     if hasattr(self, '_message_locks'):
                         expired_locks = [
@@ -956,7 +1004,7 @@ class XianyuAsync:
                             self._message_locks.pop(key, None)
                         if expired_locks:
                             logger.debug(f"【{self.cookie_id}】清理了 {len(expired_locks)} 个过期消息锁")
-                    
+
                     # 清理 delivery_sent_orders（超过24小时的订单记录）
                     expired_delivery_sent = [
                         order_id for order_id, sent_time in self.delivery_sent_orders.items()
@@ -966,7 +1014,7 @@ class XianyuAsync:
                         self.delivery_sent_orders.pop(order_id, None)
                     if expired_delivery_sent:
                         logger.debug(f"【{self.cookie_id}】清理了 {len(expired_delivery_sent)} 个过期发货记录")
-                    
+
                     # 清理 last_delivery_time（超过24小时的记录）
                     expired_delivery_time = [
                         order_id for order_id, delivery_time in self.last_delivery_time.items()
@@ -976,7 +1024,7 @@ class XianyuAsync:
                         self.last_delivery_time.pop(order_id, None)
                     if expired_delivery_time:
                         logger.debug(f"【{self.cookie_id}】清理了 {len(expired_delivery_time)} 个过期发货时间记录")
-                    
+
                     # 清理 confirmed_orders（超过24小时的确认记录）
                     expired_confirmed = [
                         order_id for order_id, confirm_time in self.confirmed_orders.items()
@@ -986,7 +1034,7 @@ class XianyuAsync:
                         self.confirmed_orders.pop(order_id, None)
                     if expired_confirmed:
                         logger.debug(f"【{self.cookie_id}】清理了 {len(expired_confirmed)} 个过期订单确认记录")
-                    
+
                     # 清理 _order_locks 相关（超过2小时未使用的锁）
                     expired_order_locks = [
                         key for key, lock_time in self._lock_usage_times.items()
@@ -998,7 +1046,7 @@ class XianyuAsync:
                         self._lock_hold_info.pop(key, None)
                     if expired_order_locks:
                         logger.debug(f"【{self.cookie_id}】清理了 {len(expired_order_locks)} 个过期订单锁")
-                    
+
                     # 每次清理后记录当前内存占用情况（仅当数据量较大时）
                     total_items = (
                         len(self.delivery_sent_orders) +
@@ -1011,35 +1059,35 @@ class XianyuAsync:
                                    f"last_delivery_time={len(self.last_delivery_time)}, "
                                    f"confirmed_orders={len(self.confirmed_orders)}, "
                                    f"order_locks={len(self._order_locks)}")
-                    
+
                     await self._interruptible_sleep(300)
-                    
+
                 except asyncio.CancelledError:
                     logger.info(f"【{self.cookie_id}】清理循环收到取消信号")
                     raise
                 except Exception as e:
                     logger.error(f"【{self.cookie_id}】清理循环异常: {e}")
                     await self._interruptible_sleep(60)
-                    
+
         except asyncio.CancelledError:
             logger.info(f"【{self.cookie_id}】清理循环已取消")
             raise
         finally:
             logger.info(f"【{self.cookie_id}】清理循环已退出")
-    
+
     # ==================== 自动发货相关方法 ====================
-    
+
     @property
     def ws(self):
         """获取当前WebSocket连接"""
         return self.connection_manager.ws if self.connection_manager else None
-    
+
     def is_lock_held(self, lock_key: str) -> bool:
         """检查锁是否被持有"""
         if lock_key not in self._lock_hold_info:
             return False
         return self._lock_hold_info[lock_key].get('locked', False)
-    
+
     async def _delayed_lock_release(self, lock_key: str, delay_minutes: int = 10):
         """延迟释放锁"""
         try:
@@ -1052,7 +1100,7 @@ class XianyuAsync:
             logger.info(f"【{self.cookie_id}】订单锁 {lock_key} 延迟释放任务被取消")
         except Exception as e:
             logger.error(f"【{self.cookie_id}】延迟释放锁失败: {e}")
-    
+
     def is_auto_confirm_enabled(self) -> bool:
         """检查是否启用自动确认发货"""
         try:
@@ -1061,7 +1109,7 @@ class XianyuAsync:
         except Exception as e:
             logger.error(f"【{self.cookie_id}】获取自动确认设置失败: {e}")
             return False
-    
+
     def is_confirm_before_send_enabled(self) -> bool:
         """检查是否开启发货成功再发卡券开关"""
         try:
@@ -1080,32 +1128,32 @@ class XianyuAsync:
             logger.error(f"【{self.cookie_id}】获取卡券发送成功再确认发货设置失败: {e}")
             return False
             return False
-    
+
     def _extract_order_id(self, message: dict) -> str:
         """从消息中提取订单ID（参照旧框架utils.py的extract_order_id实现）"""
         try:
             import re
-            
+
             order_id = None
-            
+
             # 方法1: 从message['1']['6']中提取（参照旧框架）
             message_1 = message.get('1', {})
             if isinstance(message_1, dict):
                 message_1_6 = message_1.get('6', {})
                 if isinstance(message_1_6, dict):
                     content_json_str = message_1_6.get('3', {}).get('5', '') if isinstance(message_1_6.get('3', {}), dict) else ''
-                    
+
                     if content_json_str:
                         try:
                             content_data = json.loads(content_json_str)
-                            
+
                             # 从button的targetUrl中提取orderId
                             target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('exContent', {}).get('button', {}).get('targetUrl', '')
                             if target_url:
                                 order_match = re.search(r'orderId=(\d+)', target_url)
                                 if order_match:
                                     order_id = order_match.group(1)
-                            
+
                             # 从main的targetUrl中提取
                             if not order_id:
                                 main_target_url = content_data.get('dxCard', {}).get('item', {}).get('main', {}).get('targetUrl', '')
@@ -1113,10 +1161,10 @@ class XianyuAsync:
                                     order_match = re.search(r'order_detail\?id=(\d+)', main_target_url)
                                     if order_match:
                                         order_id = order_match.group(1)
-                                        
+
                         except Exception:
                             pass
-            
+
             # 方法2: 在整个消息中搜索订单ID模式（参照旧框架）
             if not order_id:
                 message_str = str(message)
@@ -1126,28 +1174,28 @@ class XianyuAsync:
                     r'"id"\s*:\s*"?(\d{10,})"?',
                     r'bizOrderId[=:](\d{10,})',
                 ]
-                
+
                 for pattern in patterns:
                     matches = re.findall(pattern, message_str)
                     if matches:
                         order_id = matches[0]
                         break
-            
+
             if order_id:
                 logger.info(f'【{self.cookie_id}】🎯 提取到订单ID: {order_id}')
-            
+
             return order_id or ""
         except Exception as e:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {e}")
             return ""
-    
+
     async def _process_order_status(self, message: dict, send_message: str, item_id: str, buyer_id: str, msg_time: str) -> None:
         """处理订单状态（参照旧框架_process_order_status_handler）
-        
+
         当检测到付款相关消息时：
         1. 先创建订单记录（如果不存在）
         2. 异步获取订单详情（用于获取规格信息）
-        
+
         Args:
             message: 原始消息数据
             send_message: 消息内容
@@ -1164,20 +1212,20 @@ class XianyuAsync:
                 '[付款完成]',
                 '[已付款，待发货]',
             ]
-            
+
             if send_message not in fetch_detail_messages:
                 return
-            
+
             # 提取订单ID
             order_id = self._extract_order_id(message)
             logger.info(f"【{self.cookie_id}】付款消息检测: {send_message}, 提取订单ID: {order_id}")
-            
+
             if not order_id:
                 logger.warning(f"【{self.cookie_id}】付款消息无法提取订单ID: {send_message}")
                 return
-            
+
             logger.info(f"【{self.cookie_id}】提取到: item_id={item_id}, buyer_id={buyer_id}")
-            
+
             # 提取chat_id
             chat_id = ""
             try:
@@ -1193,18 +1241,18 @@ class XianyuAsync:
                         chat_id = str(chat_id_raw).split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
             except Exception:
                 pass
-            
+
             # 根据消息类型确定订单状态
             if send_message == '[我已拍下，待付款]':
                 order_status = "pending_payment"
             else:
                 order_status = "pending_ship"  # 已付款，待发货
-            
+
             # 先创建订单记录（参照旧框架order_status_handler.py）
             try:
                 from common.services.order_service import OrderService
                 from common.db.session import async_session_maker
-                
+
                 async with async_session_maker() as session:
                     order_service = OrderService(session)
                     await order_service.create_order_from_message(
@@ -1218,18 +1266,18 @@ class XianyuAsync:
                     logger.info(f"【{self.cookie_id}】订单 {order_id} 创建/更新成功，状态: {order_status}")
             except Exception as e:
                 logger.error(f"【{self.cookie_id}】创建订单失败: {e}")
-            
+
             # 异步获取订单详情，不阻塞主流程
             asyncio.create_task(self._fetch_order_detail_async(order_id, item_id, buyer_id))
-            
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理订单状态失败: {e}")
-    
+
     async def _fetch_order_detail_async(self, order_id: str, item_id: str = None, buyer_id: str = None) -> None:
         """异步获取订单详情（参照旧框架_fetch_order_detail_async）
-        
+
         不阻塞主流程，用于获取订单的规格、数量、收货人等信息
-        
+
         Args:
             order_id: 订单ID
             item_id: 商品ID
@@ -1238,30 +1286,918 @@ class XianyuAsync:
         try:
             # 延迟1秒再获取，确保订单数据已同步
             await asyncio.sleep(1)
-            
+
             logger.info(f"【{self.cookie_id}】开始异步获取订单详情: {order_id}, item_id={item_id}, buyer_id={buyer_id}")
-            
+
             # 调用订单详情获取服务
             from common.services.order_service import OrderDetailService
-            
+
             order_detail_service = OrderDetailService(self.cookie_id, self.cookies_str)
             result = await order_detail_service.fetch_and_update_order_detail(
                 order_id=order_id,
                 item_id=item_id,
                 buyer_id=buyer_id
             )
-            
+
             if result:
                 logger.info(f"【{self.cookie_id}】订单详情获取成功: {order_id}")
             else:
                 logger.warning(f"【{self.cookie_id}】订单详情获取失败: {order_id}")
-                
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】异步获取订单详情失败: {e}")
-    
+
+    def _stage_param_to_text(self, value) -> str:
+        if value is None:
+            return ""
+        try:
+            from datetime import datetime
+            if isinstance(value, datetime):
+                return value.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        return str(value)
+
+    def _normalize_price_text(self, value, *, allow_zero: bool = False) -> Optional[str]:
+        try:
+            amount = Decimal(str(value if value is not None else "").strip())
+        except (InvalidOperation, ValueError):
+            return None
+        if amount < 0 or (amount == 0 and not allow_zero):
+            return None
+        return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def _price_yuan_to_cent(self, value: str) -> str:
+        amount = Decimal(str(value))
+        return str(int((amount * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)))
+
+    def _merge_price_response_cookies(self, response) -> None:
+        try:
+            if not getattr(response, "cookies", None):
+                return
+            merged = dict(self.cookies or {})
+            changed = False
+            for name, morsel in response.cookies.items():
+                value = getattr(morsel, "value", None)
+                if value is None:
+                    continue
+                merged[name] = value
+                changed = True
+            if not changed:
+                return
+            self.cookies = merged
+            self.cookies_str = "; ".join(f"{key}={value}" for key, value in merged.items())
+            if self.session and not self.session.closed:
+                self.session.headers.update({
+                    "cookie": self.cookies_str.replace("\n", "").replace("\r", "")
+                })
+            logger.info(f"【{self.cookie_id}】自动改价：已合并 mtop 返回 Cookie")
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】自动改价：合并 Set-Cookie 失败: {exc}")
+
+    def _build_price_adjust_headers(self) -> dict:
+        return {
+            "accept": "application/json",
+            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "cache-control": "no-cache",
+            "content-type": "application/x-www-form-urlencoded",
+            "idle_site_biz_code": "COMMONPRO",
+            "idle_user_group_member_id": "",
+            "origin": "https://seller.goofish.com",
+            "pragma": "no-cache",
+            "referer": "https://seller.goofish.com/?site=COMMONPRO",
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/138.0.0.0 Safari/537.36",
+            "cookie": self.cookies_str.replace("\n", "").replace("\r", "") if self.cookies_str else "",
+        }
+
+    async def _call_price_adjust_mtop(
+        self,
+        api_name: str,
+        version: str,
+        payload: dict,
+        retry_count: int = 0,
+    ) -> dict:
+        from common.utils.xianyu_utils import generate_sign, trans_cookies
+
+        max_retry = 5 if api_name.endswith("user.adjust.price") else 3
+        data_val = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        cookies = trans_cookies(self.cookies_str) if self.cookies_str else {}
+        token = cookies.get("_m_h5_tk", "").split("_")[0] if cookies.get("_m_h5_tk") else ""
+        if not token:
+            logger.warning(f"【{self.cookie_id}】自动改价：Cookie中未找到 _m_h5_tk")
+
+        timestamp = str(int(time.time() * 1000))
+        params = {
+            "jsv": "2.7.2",
+            "appKey": "34839810",
+            "t": timestamp,
+            "sign": generate_sign(timestamp, token, data_val),
+            "v": version,
+            "type": "originaljson",
+            "accountSite": "xianyu",
+            "dataType": "json",
+            "timeout": "20000",
+            "api": api_name,
+            "sessionOption": "AutoLoginOnly",
+            "spm_cnt": "a21107h.44911108.0.0",
+            "spm_pre": "a21107h.44911108.0.0",
+        }
+        api_url = f"https://h5api.m.goofish.com/h5/{api_name}/{version}/"
+
+        try:
+            async with aiohttp.ClientSession(connector=self._build_session_connector()) as session:
+                async with session.post(
+                    api_url,
+                    params=params,
+                    data={"data": data_val},
+                    headers=self._build_price_adjust_headers(),
+                    timeout=aiohttp.ClientTimeout(total=20),
+                ) as response:
+                    res_json = await response.json(content_type=None)
+                    self._merge_price_response_cookies(response)
+                    ret_list = res_json.get("ret", []) or []
+                    logger.info(
+                        f"【{self.cookie_id}】自动改价 mtop: api={api_name}, "
+                        f"第{retry_count + 1}次响应 ret={ret_list}"
+                    )
+                    if any("SUCCESS" in str(item) for item in ret_list):
+                        return {"success": True, "ret": ret_list, "data": res_json.get("data") or {}}
+                    if retry_count < max_retry - 1:
+                        retry_delay = 0.5
+                        if (
+                            api_name.endswith("user.adjust.price")
+                            and any("FAIL_BIZ_CANNOT_MODIFY_FEE" in str(item) for item in ret_list)
+                        ):
+                            retry_delay = [5, 10, 15, 30][min(retry_count, 3)]
+                            logger.info(
+                                f"【{self.cookie_id}】自动改价：订单暂不可改价，"
+                                f"{retry_delay}秒后重试提交"
+                            )
+                        await asyncio.sleep(retry_delay)
+                        return await self._call_price_adjust_mtop(api_name, version, payload, retry_count + 1)
+                    return {"success": False, "ret": ret_list, "message": ";".join(map(str, ret_list)) or "mtop调用失败"}
+        except asyncio.TimeoutError:
+            logger.warning(f"【{self.cookie_id}】自动改价 mtop 超时: api={api_name}")
+            if retry_count < max_retry - 1:
+                await asyncio.sleep(0.5)
+                return await self._call_price_adjust_mtop(api_name, version, payload, retry_count + 1)
+            return {"success": False, "ret": [], "message": "mtop请求超时"}
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】自动改价 mtop 异常: api={api_name}, {self._safe_str(exc)}")
+            if retry_count < max_retry - 1:
+                await asyncio.sleep(0.5)
+                return await self._call_price_adjust_mtop(api_name, version, payload, retry_count + 1)
+            return {"success": False, "ret": [], "message": self._safe_str(exc)}
+
+    def _parse_price_render_data(self, render_data: dict) -> dict:
+        render_list = (render_data or {}).get("modifyPriceRenderList")
+        if isinstance(render_list, list):
+            values = {}
+            for item in render_list:
+                if not isinstance(item, dict):
+                    continue
+                key = item.get("key")
+                if not key:
+                    continue
+                values[key] = self._normalize_price_text(item.get("price"), allow_zero=True) or "0.00"
+            item_price = values.get("modifyFee", "0.00")
+            post_fee = values.get("newTransportFee", "0.00")
+            try:
+                total_price = str((Decimal(item_price) + Decimal(post_fee)).quantize(Decimal("0.01")))
+            except (InvalidOperation, ValueError):
+                total_price = item_price
+            return {
+                "original_total_price": total_price,
+                "original_post_fee": post_fee,
+                "original_item_price": item_price,
+            }
+
+        module = (render_data or {}).get("module") or {}
+        price_vo = module.get("merchantPriceVO") or {}
+        total_price = self._normalize_price_text(price_vo.get("totalPrice"), allow_zero=True) or "0.00"
+        post_fee = self._normalize_price_text(price_vo.get("postFee"), allow_zero=True) or "0.00"
+        try:
+            item_price = str((Decimal(total_price) - Decimal(post_fee)).quantize(Decimal("0.01")))
+        except (InvalidOperation, ValueError):
+            item_price = ""
+        return {
+            "original_total_price": total_price,
+            "original_post_fee": post_fee,
+            "original_item_price": item_price,
+        }
+
+    async def adjust_order_price(
+        self,
+        order_no: str,
+        item_id: str,
+        target_item_price: str,
+        target_post_fee: str,
+    ) -> dict:
+        """复刻卖家工作台 mtop：先取改价页数据，再提交改后商品总价/邮费。"""
+        if not order_no:
+            return {"success": False, "message": "订单号为空"}
+        target_item_price = self._normalize_price_text(target_item_price)
+        target_post_fee = self._normalize_price_text(target_post_fee, allow_zero=True)
+        if not target_item_price or target_post_fee is None:
+            return {"success": False, "message": "目标价格非法"}
+
+        initial_delay = self._get_order_price_adjust_initial_delay()
+        if initial_delay > 0:
+            logger.info(f"【{self.cookie_id}】自动改价：等待{initial_delay}秒后提交改价 order_id={order_no}")
+            await asyncio.sleep(initial_delay)
+
+        render_result = await self._call_price_adjust_mtop(
+            "mtop.taobao.idle.trade.order.modify.price.render",
+            "1.0",
+            {"bizOrderId": str(order_no)},
+        )
+        render_api = "pc"
+        if not render_result.get("success"):
+            merchant_render = await self._call_price_adjust_mtop(
+                "mtop.taobao.idle.trade.merchant.adjust.price.render",
+                "1.0",
+                {"orderId": str(order_no)},
+            )
+            if merchant_render.get("success"):
+                render_result = merchant_render
+                render_api = "merchant"
+        original = {}
+        if not render_result.get("success"):
+            return {
+                "success": False,
+                "message": render_result.get("message") or "获取改价信息失败",
+                "ret": render_result.get("ret") or [],
+                "original": original,
+            }
+        original = self._parse_price_render_data(render_result.get("data") or {})
+
+        submit_payload = {
+            "orderId": str(order_no),
+            "modifyFee": self._price_yuan_to_cent(target_item_price),
+            "newTransportFee": self._price_yuan_to_cent(target_post_fee),
+        }
+        submit_result = await self._call_price_adjust_mtop(
+            "mtop.taobao.idle.trade.user.adjust.price",
+            "1.0",
+            submit_payload,
+        )
+        submit_api = "pc"
+        if not submit_result.get("success") and render_api == "merchant":
+            submit_result = await self._call_price_adjust_mtop(
+                "mtop.taobao.idle.trade.merchant.user.adjust.price",
+                "1.0",
+                submit_payload,
+            )
+            submit_api = "merchant"
+        if submit_result.get("success"):
+            return {
+                "success": True,
+                "message": f"价格修改成功({submit_api})",
+                "ret": submit_result.get("ret") or [],
+                "original": original,
+                "target_item_price": target_item_price,
+                "target_post_fee": target_post_fee,
+            }
+        return {
+            "success": False,
+            "message": f"{submit_result.get('message') or '价格修改失败'}({submit_api})",
+            "ret": submit_result.get("ret") or [],
+            "original": original,
+            "target_item_price": target_item_price,
+            "target_post_fee": target_post_fee,
+        }
+
+    def _get_order_price_adjust_initial_delay(self) -> int:
+        try:
+            raw_delay = os.getenv("ORDER_PRICE_ADJUST_INITIAL_DELAY_SECONDS", "12")
+            return max(0, min(int(raw_delay), 120))
+        except (TypeError, ValueError):
+            return 12
+
+    async def _has_price_adjust_record(self, session, order_id: str) -> bool:
+        from sqlalchemy import select
+        from common.models.order_price_adjust_record import OrderPriceAdjustRecord
+
+        result = await session.execute(
+            select(OrderPriceAdjustRecord).where(
+                OrderPriceAdjustRecord.account_id == self.cookie_id,
+                OrderPriceAdjustRecord.order_no == order_id,
+            )
+        )
+        record = result.scalars().first()
+        return bool(record and record.result_status == "success")
+
+    async def _record_price_adjust_result(
+        self,
+        session,
+        *,
+        action,
+        params: dict,
+        result: dict,
+        status: str,
+        message: str,
+    ) -> None:
+        from sqlalchemy.exc import IntegrityError
+        from common.models.order_price_adjust_record import OrderPriceAdjustRecord
+
+        original = result.get("original") or {}
+        from sqlalchemy import select
+        existing_result = await session.execute(
+            select(OrderPriceAdjustRecord).where(
+                OrderPriceAdjustRecord.account_id == self.cookie_id,
+                OrderPriceAdjustRecord.order_no == (params.get("order_no", "") or ""),
+            )
+        )
+        record = existing_result.scalars().first()
+        if record is None:
+            record = OrderPriceAdjustRecord(
+                owner_id=getattr(action, "owner_id", 0) or 0,
+                account_id=self.cookie_id,
+                item_id=params.get("item_id", "") or "",
+                order_no=params.get("order_no", "") or "",
+            )
+            session.add(record)
+
+        record.owner_id = getattr(action, "owner_id", 0) or 0
+        record.item_id = params.get("item_id", "") or ""
+        record.buyer_id = params.get("buyer_id", "") or None
+        record.chat_id = params.get("chat_id", "") or None
+        record.target_item_price = result.get("target_item_price") or params.get("target_item_price") or None
+        record.target_post_fee = result.get("target_post_fee") or params.get("target_post_fee") or None
+        record.original_item_price = original.get("original_item_price") or None
+        record.original_post_fee = original.get("original_post_fee") or None
+        record.original_total_price = original.get("original_total_price") or None
+        record.result_status = status
+        record.result_message = (message or "")[:2000]
+        record.ret = json.dumps(result.get("ret") or [], ensure_ascii=False, default=str)[:2000]
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            logger.info(f"【{self.cookie_id}】自动改价记录并发写入冲突: order_no={record.order_no}")
+
+    async def _load_price_adjust_context(
+        self,
+        session,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+    ) -> tuple[Optional[object], dict]:
+        from sqlalchemy import select
+        from common.models.order_price_adjustment import OrderPriceAdjustment
+        from common.models.xy_account import XYAccount
+        from common.models.xy_catalog_item import XYCatalogItem
+        from common.models.xy_order import XYOrder
+
+        account_result = await session.execute(
+            select(XYAccount).where(XYAccount.account_id == self.cookie_id)
+        )
+        account = account_result.scalars().first()
+
+        order_result = await session.execute(
+            select(XYOrder).where(
+                XYOrder.order_no == order_id,
+                XYOrder.account_id == self.cookie_id,
+            )
+        )
+        order = order_result.scalars().first()
+
+        resolved_item_id = item_id or (getattr(order, "item_id", "") if order else "")
+        resolved_buyer_id = buyer_id or (getattr(order, "buyer_id", "") if order else "")
+        resolved_chat_id = chat_id or (getattr(order, "chat_id", "") if order else "")
+
+        action_result = await session.execute(
+            select(OrderPriceAdjustment).where(
+                OrderPriceAdjustment.account_id == self.cookie_id,
+                OrderPriceAdjustment.enabled == True,
+                OrderPriceAdjustment.item_id.in_([resolved_item_id or "", ""]),
+            )
+        )
+        actions = action_result.scalars().all()
+        action = None
+        for candidate in actions:
+            if (candidate.item_id or "") == (resolved_item_id or ""):
+                action = candidate
+                break
+        if action is None and actions:
+            action = actions[0]
+
+        item = None
+        if account and resolved_item_id:
+            item_result = await session.execute(
+                select(XYCatalogItem).where(
+                    XYCatalogItem.account_pk == account.id,
+                    XYCatalogItem.item_id == resolved_item_id,
+                )
+            )
+            item = item_result.scalars().first()
+
+        now_text = get_beijing_now_naive().strftime("%Y-%m-%d %H:%M:%S")
+        params = {
+            "stage": "purchase",
+            "account_id": self.cookie_id or "",
+            "cookie_id": self.cookie_id or "",
+            "item_id": resolved_item_id or "",
+            "item_title": (getattr(item, "title", "") if item else "") or "",
+            "item_price": (getattr(item, "price", "") if item else "") or "",
+            "order_no": order_id or "",
+            "order_id": order_id or "",
+            "order_status": (getattr(order, "status", None) if order else None) or order_status or "",
+            "buyer_id": resolved_buyer_id or "",
+            "buyer_name": (
+                (getattr(order, "buyer_fish_nick", None) if order else None)
+                or (getattr(order, "buyer_nick", None) if order else None)
+                or buyer_name
+                or ""
+            ),
+            "chat_id": resolved_chat_id or "",
+            "amount": self._stage_param_to_text(getattr(order, "amount", None) if order else None),
+            "quantity": self._stage_param_to_text(getattr(order, "quantity", None) if order else None),
+            "spec_name": (getattr(order, "spec_name", "") if order else "") or "",
+            "spec_value": (getattr(order, "spec_value", "") if order else "") or "",
+            "placed_at": self._stage_param_to_text(getattr(order, "placed_at", None) if order else None),
+            "timestamp": now_text,
+        }
+        return action, params
+
+    async def _call_price_override(self, action, params: dict) -> dict:
+        override_url = (getattr(action, "override_url", "") or "").strip()
+        if not override_url:
+            return {}
+        timeout_seconds = int(getattr(action, "override_timeout", 10) or 10)
+        payload = dict(params)
+        payload["configured_item_price"] = getattr(action, "target_item_price", "") or ""
+        payload["configured_post_fee"] = getattr(action, "target_post_fee", "") or ""
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                if override_url.startswith(("ws://", "wss://")):
+                    async with http.ws_connect(override_url, timeout=timeout_seconds) as ws:
+                        await ws.send_json(payload)
+                        msg = await ws.receive(timeout=timeout_seconds)
+                        if msg.type != aiohttp.WSMsgType.TEXT:
+                            return {}
+                        data = json.loads(msg.data)
+                else:
+                    async with http.post(override_url, json=payload, allow_redirects=False) as resp:
+                        if resp.status in (301, 302, 303, 307, 308):
+                            logger.warning(f"【{self.cookie_id}】自动改价外部接口返回重定向({resp.status})，已拒绝")
+                            return {}
+                        data = await resp.json(content_type=None)
+            if not isinstance(data, dict):
+                return {}
+            item_price = self._normalize_price_text(data.get("item_price"))
+            post_fee = self._normalize_price_text(data.get("post_fee", "0.00"), allow_zero=True)
+            if item_price and post_fee is not None:
+                return {"item_price": item_price, "post_fee": post_fee}
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】自动改价外部接口调用失败，回退手动配置: {exc}")
+        return {}
+
+    async def _execute_order_price_adjustment(
+        self,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+    ) -> None:
+        if not order_id:
+            return
+
+        lock_name = f"order_price_adjust:{self.cookie_id}:{order_id}"
+        try:
+            from common.db.redis_client import distributed_lock
+            async with distributed_lock(lock_name, expire=180, blocking=True, timeout=5) as lock:
+                if not getattr(lock, "is_locked", False):
+                    logger.warning(f"【{self.cookie_id}】自动改价锁获取超时，依赖DB去重继续执行: {lock_name}")
+                await self._execute_order_price_adjustment_locked(
+                    order_id, order_status, item_id, buyer_id, buyer_name, chat_id
+                )
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】自动改价锁异常，依赖DB去重继续执行: {exc}")
+            await self._execute_order_price_adjustment_locked(
+                order_id, order_status, item_id, buyer_id, buyer_name, chat_id
+            )
+
+    async def _execute_order_price_adjustment_locked(
+        self,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+    ) -> None:
+        try:
+            from common.db.session import async_session_maker
+
+            async with async_session_maker() as session:
+                if await self._has_price_adjust_record(session, order_id):
+                    logger.info(f"【{self.cookie_id}】自动改价已处理过，跳过: order_id={order_id}")
+                    return
+
+                action, params = await self._load_price_adjust_context(
+                    session=session,
+                    order_id=order_id,
+                    order_status=order_status,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    buyer_name=buyer_name,
+                    chat_id=chat_id,
+                )
+                if not action:
+                    return
+
+                override = await self._call_price_override(action, params)
+                target_item_price = override.get("item_price") or getattr(action, "target_item_price", "") or ""
+                target_post_fee = override.get("post_fee") or getattr(action, "target_post_fee", "") or "0.00"
+                target_item_price = self._normalize_price_text(target_item_price)
+                target_post_fee = self._normalize_price_text(target_post_fee, allow_zero=True)
+                params["target_item_price"] = target_item_price or ""
+                params["target_post_fee"] = target_post_fee or ""
+                if not target_item_price or target_post_fee is None:
+                    await self._record_price_adjust_result(
+                        session,
+                        action=action,
+                        params=params,
+                        result={},
+                        status="failed",
+                        message="目标价格非法",
+                    )
+                    return
+
+                result = await self.adjust_order_price(
+                    order_no=order_id,
+                    item_id=params.get("item_id", "") or "",
+                    target_item_price=target_item_price,
+                    target_post_fee=target_post_fee,
+                )
+                status = "success" if result.get("success") else "failed"
+                message = result.get("message") or ("价格修改成功" if status == "success" else "价格修改失败")
+                await self._record_price_adjust_result(
+                    session,
+                    action=action,
+                    params=params,
+                    result=result,
+                    status=status,
+                    message=message,
+                )
+                logger.info(
+                    f"【{self.cookie_id}】自动改价{status}: order_id={order_id}, "
+                    f"item_price={target_item_price}, post_fee={target_post_fee}, message={message}"
+                )
+        except Exception as exc:
+            logger.error(f"【{self.cookie_id}】执行自动改价失败: {self._safe_str(exc)}")
+
+    def _render_stage_reply_template(self, template: str, params: dict) -> str:
+        content = template or ""
+        for key, value in params.items():
+            content = content.replace("{" + key + "}", self._stage_param_to_text(value))
+        return content
+
+    def _build_stage_api_payload(self, action, params: dict) -> dict:
+        """构建阶段回复 API payload；旧 api_params 存在时作为兼容模板。"""
+        if not getattr(action, "api_params", None):
+            return dict(params)
+        try:
+            payload_str = json.dumps(json.loads(action.api_params), ensure_ascii=False)
+            rendered = self._render_stage_reply_template(payload_str, params)
+            payload = json.loads(rendered)
+            if isinstance(payload, dict):
+                return payload
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】阶段回复旧版 api_params 解析失败，改用默认payload: {exc}")
+        return dict(params)
+
+    async def _call_stage_reply_api(self, action, params: dict) -> Optional[str]:
+        from common.utils.default_reply_api import (
+            normalize_api_timeout,
+            parse_api_reply,
+            validate_api_url,
+        )
+
+        api_url = (getattr(action, "api_url", "") or "").strip()
+        if not api_url:
+            logger.info(f"【{self.cookie_id}】阶段回复API地址为空，跳过")
+            return None
+        valid, err = validate_api_url(api_url)
+        if not valid:
+            logger.warning(f"【{self.cookie_id}】阶段回复API地址非法，跳过调用: {err}")
+            return None
+
+        timeout_seconds = normalize_api_timeout(getattr(action, "api_timeout", 80) or 80)
+        payload = self._build_stage_api_payload(action, params)
+        try:
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            async with aiohttp.ClientSession(timeout=timeout) as http:
+                async with http.post(api_url, json=payload, allow_redirects=False) as resp:
+                    if resp.status in (301, 302, 303, 307, 308):
+                        logger.warning(
+                            f"【{self.cookie_id}】阶段回复API返回重定向({resp.status})，"
+                            f"已拒绝跟随"
+                        )
+                        return None
+                    body = await resp.text()
+                    return parse_api_reply(resp.status, body)
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】阶段回复API调用失败: {exc}")
+            return None
+
+    async def _load_stage_reply_context(
+        self,
+        session,
+        stage: str,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+    ) -> tuple[Optional[object], dict]:
+        from sqlalchemy import select
+        from common.models.purchase_action import PurchaseAction
+        from common.models.xy_account import XYAccount
+        from common.models.xy_catalog_item import XYCatalogItem
+        from common.models.xy_order import XYOrder
+
+        account_result = await session.execute(
+            select(XYAccount).where(XYAccount.account_id == self.cookie_id)
+        )
+        account = account_result.scalars().first()
+
+        order_result = await session.execute(
+            select(XYOrder).where(
+                XYOrder.order_no == order_id,
+                XYOrder.account_id == self.cookie_id,
+            )
+        )
+        order = order_result.scalars().first()
+
+        resolved_item_id = item_id or (getattr(order, "item_id", "") if order else "")
+        resolved_buyer_id = buyer_id or (getattr(order, "buyer_id", "") if order else "")
+        resolved_chat_id = chat_id or (getattr(order, "chat_id", "") if order else "")
+
+        action_result = await session.execute(
+            select(PurchaseAction).where(
+                PurchaseAction.account_id == self.cookie_id,
+                PurchaseAction.stage == stage,
+                PurchaseAction.enabled == True,
+                PurchaseAction.item_id.in_([resolved_item_id or "", ""]),
+            )
+        )
+        actions = action_result.scalars().all()
+        action = None
+        for candidate in actions:
+            if (candidate.item_id or "") == (resolved_item_id or ""):
+                action = candidate
+                break
+        if action is None and actions:
+            action = actions[0]
+
+        item = None
+        if account and resolved_item_id:
+            item_result = await session.execute(
+                select(XYCatalogItem).where(
+                    XYCatalogItem.account_pk == account.id,
+                    XYCatalogItem.item_id == resolved_item_id,
+                )
+            )
+            item = item_result.scalars().first()
+
+        now_text = get_beijing_now_naive().strftime("%Y-%m-%d %H:%M:%S")
+        account_name = (
+            (getattr(order, "account_name", None) if order else None)
+            or (getattr(account, "display_name", None) if account else None)
+            or (getattr(account, "username", None) if account else None)
+            or self.cookie_id
+        )
+        display_buyer_name = (
+            (getattr(order, "buyer_fish_nick", None) if order else None)
+            or (getattr(order, "buyer_nick", None) if order else None)
+            or buyer_name
+            or ""
+        )
+        params = {
+            "stage": stage,
+            "account_id": self.cookie_id or "",
+            "cookie_id": self.cookie_id or "",
+            "account_name": account_name or "",
+            "item_id": resolved_item_id or "",
+            "item_title": (getattr(item, "title", "") if item else "") or "",
+            "item_name": (getattr(item, "title", "") if item else "") or "",
+            "item_price": (getattr(item, "price", "") if item else "") or "",
+            "order_no": order_id or "",
+            "order_id": order_id or "",
+            "order_status": (getattr(order, "status", None) if order else None) or order_status or "",
+            "buyer_id": resolved_buyer_id or "",
+            "buyer_name": display_buyer_name,
+            "send_user_name": display_buyer_name,
+            "chat_id": resolved_chat_id or "",
+            "amount": self._stage_param_to_text(getattr(order, "amount", None) if order else None),
+            "quantity": self._stage_param_to_text(getattr(order, "quantity", None) if order else None),
+            "spec_name": (getattr(order, "spec_name", "") if order else "") or "",
+            "spec_value": (getattr(order, "spec_value", "") if order else "") or "",
+            "placed_at": self._stage_param_to_text(getattr(order, "placed_at", None) if order else None),
+            "timestamp": now_text,
+        }
+        return action, params
+
+    async def _has_stage_reply_sent(self, session, stage: str, order_id: str) -> bool:
+        from sqlalchemy import select
+        from common.models.order_stage_reply_record import OrderStageReplyRecord
+
+        result = await session.execute(
+            select(OrderStageReplyRecord).where(
+                OrderStageReplyRecord.account_id == self.cookie_id,
+                OrderStageReplyRecord.stage == stage,
+                OrderStageReplyRecord.order_no == order_id,
+            )
+        )
+        return result.scalars().first() is not None
+
+    async def _record_stage_reply_sent(
+        self,
+        session,
+        action,
+        params: dict,
+        reply_text: str,
+        reply_image: str,
+        send_results: list,
+    ) -> None:
+        from sqlalchemy.exc import IntegrityError
+        from common.models.order_stage_reply_record import OrderStageReplyRecord
+
+        record = OrderStageReplyRecord(
+            owner_id=getattr(action, "owner_id", 0) or 0,
+            account_id=self.cookie_id,
+            item_id=params.get("item_id", "") or "",
+            stage=params.get("stage", "") or "",
+            order_no=params.get("order_no", "") or "",
+            buyer_id=params.get("buyer_id", "") or None,
+            chat_id=params.get("chat_id", "") or None,
+            reply_text=reply_text or None,
+            reply_image=reply_image or None,
+            send_status="success",
+            send_result=json.dumps(send_results, ensure_ascii=False, default=str)[:2000],
+        )
+        session.add(record)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            logger.info(
+                f"【{self.cookie_id}】阶段回复记录已存在，跳过重复写入: "
+                f"stage={record.stage}, order_no={record.order_no}"
+            )
+
+    async def _execute_order_stage_reply(
+        self,
+        stage: str,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+        source_message: str,
+        ws,
+    ) -> None:
+        """执行拍下/付款阶段回复：查配置 -> 渲染/API -> 发送 -> 成功去重记录。"""
+        if stage not in ORDER_STAGE_LABELS or not order_id:
+            return
+        if not chat_id or not buyer_id:
+            logger.warning(
+                f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}缺少 chat_id 或 buyer_id，"
+                f"跳过发送: order_id={order_id}, chat_id={chat_id}, buyer_id={buyer_id}"
+            )
+            return
+        if not hasattr(self, "auto_delivery_handler") or not self.auto_delivery_handler:
+            logger.warning(f"【{self.cookie_id}】auto_delivery_handler未初始化，跳过阶段回复")
+            return
+
+        lock_name = f"order_stage_reply:{self.cookie_id}:{stage}:{order_id}"
+        try:
+            from common.db.redis_client import distributed_lock
+            async with distributed_lock(lock_name, expire=180, blocking=True, timeout=5) as lock:
+                if not getattr(lock, "is_locked", False):
+                    logger.warning(f"【{self.cookie_id}】阶段回复锁获取超时，依赖DB去重继续执行: {lock_name}")
+                await self._execute_order_stage_reply_locked(
+                    stage, order_id, order_status, item_id, buyer_id, buyer_name, chat_id, source_message, ws
+                )
+        except Exception as exc:
+            logger.warning(f"【{self.cookie_id}】阶段回复锁异常，依赖DB去重继续执行: {exc}")
+            await self._execute_order_stage_reply_locked(
+                stage, order_id, order_status, item_id, buyer_id, buyer_name, chat_id, source_message, ws
+            )
+
+    async def _execute_order_stage_reply_locked(
+        self,
+        stage: str,
+        order_id: str,
+        order_status: str,
+        item_id: str,
+        buyer_id: str,
+        buyer_name: str,
+        chat_id: str,
+        source_message: str,
+        ws,
+    ) -> None:
+        try:
+            from common.db.session import async_session_maker
+
+            async with async_session_maker() as session:
+                if await self._has_stage_reply_sent(session, stage, order_id):
+                    logger.info(
+                        f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}已成功发送过，"
+                        f"跳过: order_id={order_id}"
+                    )
+                    return
+
+                action, params = await self._load_stage_reply_context(
+                    session=session,
+                    stage=stage,
+                    order_id=order_id,
+                    order_status=order_status,
+                    item_id=item_id,
+                    buyer_id=buyer_id,
+                    buyer_name=buyer_name,
+                    chat_id=chat_id,
+                )
+                if not action:
+                    return
+
+                params["source_message"] = source_message or ""
+                reply_text = ""
+                if (getattr(action, "action_type", "message") or "message") == "api":
+                    api_reply = await self._call_stage_reply_api(action, params)
+                    if not api_reply or not api_reply.strip():
+                        logger.info(
+                            f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}API无有效返回，"
+                            f"不发送且不记录成功: order_id={order_id}"
+                        )
+                        return
+                    reply_text = api_reply.strip()
+                else:
+                    reply_text = self._render_stage_reply_template(
+                        getattr(action, "message_template", "") or "",
+                        params,
+                    ).strip()
+
+                reply_image = (getattr(action, "reply_image", "") or "").strip()
+                if not reply_text and not reply_image:
+                    logger.info(
+                        f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}内容为空，"
+                        f"跳过: order_id={order_id}"
+                    )
+                    return
+
+                send_results = []
+                all_success = True
+                if reply_image:
+                    image_result = await self.auto_delivery_handler._send_image_msg_with_retry(
+                        ws,
+                        chat_id,
+                        buyer_id,
+                        reply_image,
+                    )
+                    send_results.append(image_result)
+                    all_success = all_success and isinstance(image_result, dict) and image_result.get("success", False)
+
+                if reply_text:
+                    text_success = await self.auto_delivery_handler._send_text_with_separator(
+                        ws,
+                        chat_id,
+                        buyer_id,
+                        reply_text,
+                        send_results=send_results,
+                    )
+                    all_success = all_success and bool(text_success)
+
+                if not all_success:
+                    logger.warning(
+                        f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}发送失败，"
+                        f"不记录成功: order_id={order_id}, results={send_results}"
+                    )
+                    return
+
+                await self._record_stage_reply_sent(session, action, params, reply_text, reply_image, send_results)
+                logger.info(
+                    f"【{self.cookie_id}】{ORDER_STAGE_LABELS.get(stage, stage)}发送成功: "
+                    f"order_id={order_id}, item_id={params.get('item_id', '')}"
+                )
+        except Exception as e:
+            logger.error(
+                f"【{self.cookie_id}】执行{ORDER_STAGE_LABELS.get(stage, stage)}失败: {self._safe_str(e)}"
+            )
+
     async def _handle_auto_delivery_from_message(self, parsed_message: dict, websocket) -> None:
         """从解析后的消息触发自动发货（参照旧框架message_handler_core.py）
-        
+
         Args:
             parsed_message: 解析后的消息数据
             websocket: WebSocket连接
@@ -1274,9 +2210,9 @@ class XianyuAsync:
             item_id = parsed_message.get("item_id", "")
             msg_time = parsed_message.get("msg_time", "")
             raw_message = parsed_message.get("raw_message", {})
-            
+
             logger.info(f"【{self.cookie_id}】开始处理自动发货: item_id={item_id}, chat_id={chat_id}")
-            
+
             # 调用auto_delivery_handler的_handle_auto_delivery方法
             if hasattr(self, 'auto_delivery_handler') and self.auto_delivery_handler:
                 await self.auto_delivery_handler._handle_auto_delivery(
@@ -1290,17 +2226,17 @@ class XianyuAsync:
                 )
             else:
                 logger.warning(f"【{self.cookie_id}】auto_delivery_handler未初始化，跳过自动发货")
-                
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理自动发货失败: {e}")
             import traceback
             logger.error(traceback.format_exc())
-    
+
     async def _handle_card_message(self, parsed_message: dict, websocket) -> None:
         """处理卡片消息（参照旧框架message_handler_core.py的_handle_card_message）
-        
+
         用于检测"小刀"等卡片消息并触发相应处理
-        
+
         Args:
             parsed_message: 解析后的消息数据，包含card_title
             websocket: WebSocket连接
@@ -1313,12 +2249,12 @@ class XianyuAsync:
             chat_id = parsed_message.get("chat_id", "")
             msg_time = parsed_message.get("msg_time", "")
             raw_message = parsed_message.get("raw_message", {})
-            
+
             # 检测"小刀"卡片消息（参照旧框架）
             if card_title == "我已小刀，待刀成":
                 order_id = self._extract_order_id(raw_message)
                 logger.info(f"【{self.cookie_id}】检测到小刀卡片消息: order_id={order_id}, item_id={item_id}")
-                
+
                 # 更新订单小刀状态
                 if order_id:
                     try:
@@ -1327,7 +2263,7 @@ class XianyuAsync:
                         logger.info(f"【{self.cookie_id}】订单 {order_id} 检测到小刀，已更新小刀状态")
                     except Exception as e:
                         logger.error(f"【{self.cookie_id}】更新订单小刀状态失败: {e}")
-                
+
                 # 检查是否启用自动确认发货
                 if self.is_auto_confirm_enabled():
                     if order_id:
@@ -1414,15 +2350,15 @@ class XianyuAsync:
                             logger.warning(f"【{self.cookie_id}】auto_delivery_handler未初始化，跳过小刀处理")
             else:
                 logger.debug(f"【{self.cookie_id}】收到卡片消息: {card_title}")
-                
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理卡片消息失败: {e}")
-    
+
     async def _handle_rate_request_message(self, parsed_message: dict, websocket) -> None:
         """处理评价请求消息，自动评价买家（参照旧框架message_handler_core.py）
-        
+
         同时触发确认收货消息（因为系统有时候不发送"买家确认收货，交易成功"消息）
-        
+
         Args:
             parsed_message: 解析后的消息数据
             websocket: WebSocket连接
@@ -1432,7 +2368,7 @@ class XianyuAsync:
             msg_time = parsed_message.get("msg_time", "")
             item_id = parsed_message.get("item_id", "")
             raw_message = parsed_message.get("raw_message", {})
-            
+
             # 检查商品是否属于当前账号（只有商品ID存在时才检查）
             from app.services.xianyu.rate_service import check_item_belongs_to_account
             if item_id:
@@ -1441,60 +2377,60 @@ class XianyuAsync:
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】商品 {item_id} 不属于当前账号，跳过自动评价和确认收货消息")
                     return
             # 商品ID不存在时继续执行原有逻辑
-            
+
             # 先触发确认收货消息（因为系统有时候不发送"买家确认收货，交易成功"消息）
             logger.info(f"[{msg_time}] 【{self.cookie_id}】评价请求消息同时触发确认收货消息")
             await self._handle_confirm_receipt_message(parsed_message, websocket)
-            
+
             # 提取订单ID
             order_id = self._extract_order_id(raw_message)
             if not order_id:
                 logger.warning(f"[{msg_time}] 【{self.cookie_id}】评价消息无法提取订单ID，跳过自动评价")
                 return
-            
+
             # 获取评价内容配置
             from app.services.xianyu.rate_service import RateService, update_order_rated_status, get_rate_feedback_content
-            
+
             feedback = await get_rate_feedback_content(self.cookie_id)
             if feedback is None:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】自动评价未启用或获取评价内容失败，跳过")
                 return
-            
+
             logger.info(f"[{msg_time}] 【{self.cookie_id}】收到评价请求，订单ID: {order_id}，商品ID: {item_id}，开始自动评价，内容: {feedback[:30]}...")
-            
+
             # 调用评价服务（传入account_id支持令牌过期自动刷新Cookie）
             rate_service = RateService(self.cookies_str, account_id=self.cookie_id)
             result = await rate_service.rate_buyer(order_id, feedback=feedback)
-            
+
             if result.get('success'):
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 自动评价成功")
                 # 更新订单评价状态
                 await update_order_rated_status(order_id, True)
             else:
                 logger.warning(f"[{msg_time}] 【{self.cookie_id}】订单 {order_id} 自动评价失败: {result.get('message')}")
-                
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理评价请求消息异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
-    
+
     async def _handle_confirm_receipt_message(self, parsed_message: dict, websocket):
         """处理买家确认收货消息，发送配置的确认收货回复
-        
+
         参照旧框架 message_handler_core.py 的 _handle_confirm_receipt_message 方法
-        
+
         Args:
             parsed_message: 解析后的消息
             websocket: WebSocket连接
         """
         try:
             msg_time = get_beijing_now_naive().strftime("%Y-%m-%d %H:%M:%S")
-            
+
             chat_id = parsed_message.get("chat_id", "")
             send_user_id = parsed_message.get("send_user_id", "")
             send_user_name = parsed_message.get("send_user_name", "")
             item_id = parsed_message.get("item_id", "")
-            
+
             # 检查商品是否属于当前账号（只有商品ID存在时才检查）
             if item_id:
                 from app.services.xianyu.rate_service import check_item_belongs_to_account
@@ -1503,32 +2439,32 @@ class XianyuAsync:
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】商品 {item_id} 不属于当前账号，跳过确认收货消息")
                     return
             # 商品ID不存在时继续执行原有逻辑
-            
+
             from common.db.session import async_session_maker
             from sqlalchemy import select
             from common.models.confirm_receipt_message import ConfirmReceiptMessage
-            
+
             # 查询确认收货消息配置
             async with async_session_maker() as db_session:
                 result = await db_session.execute(
                     select(ConfirmReceiptMessage).where(ConfirmReceiptMessage.account_id == self.cookie_id)
                 )
                 config = result.scalar_one_or_none()
-                
+
                 if not config or not config.enabled:
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】确认收货消息未启用，跳过")
                     return
-                
+
                 # 检查是否有内容需要发送
                 has_image = config.message_image and config.message_image.strip()
                 has_content = config.message_content and config.message_content.strip()
-                
+
                 if not has_image and not has_content:
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】确认收货消息内容为空，跳过")
                     return
-                
+
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】检测到买家确认收货，准备发送确认收货消息")
-                
+
                 # 先发送图片（如果有）
                 if has_image:
                     try:
@@ -1539,7 +2475,7 @@ class XianyuAsync:
                             logger.info(f"[{msg_time}] 【确认收货图片发出】用户: {send_user_name}, 商品({item_id}): 图片已发送")
                     except Exception as img_error:
                         logger.error(f"[{msg_time}] 【{self.cookie_id}】发送确认收货图片失败: {img_error}")
-                
+
                 # 再发送文字（如果有）
                 if has_content:
                     try:
@@ -1547,19 +2483,19 @@ class XianyuAsync:
                         logger.info(f"[{msg_time}] 【确认收货消息发出】用户: {send_user_name}, 商品({item_id}): {config.message_content.strip()[:50]}...")
                     except Exception as msg_error:
                         logger.error(f"[{msg_time}] 【{self.cookie_id}】发送确认收货消息失败: {msg_error}")
-                        
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】处理确认收货消息异常: {e}")
             import traceback
             logger.error(traceback.format_exc())
-    
+
     async def _process_confirm_receipt_image(self, image_url: str, msg_time: str) -> str:
         """处理确认收货消息的图片，上传到CDN并返回CDN链接
-        
+
         Args:
             image_url: 图片URL（可能是本地路径或CDN链接）
             msg_time: 消息时间
-            
+
         Returns:
             CDN图片URL，失败返回None
         """
@@ -1568,25 +2504,25 @@ class XianyuAsync:
             import tempfile
             import aiohttp
             from pathlib import Path
-            
+
             if not image_url or not image_url.strip():
                 return None
-            
+
             # 判断是否是CDN链接
             cdn_domains = ['gw.alicdn.com', 'img.alicdn.com', 'cdn.', 'oss-cn-', 'cloud.goofish.com']
             is_cdn = any(domain in image_url for domain in cdn_domains)
-            
+
             if is_cdn:
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】确认收货消息使用已有的CDN图片链接: {image_url}")
                 return image_url
-            
+
             # 处理本地图片路径（图片存储在backend-web服务）
             if image_url.startswith('/static/uploads/') or image_url.startswith('static/uploads/'):
                 from app.utils.image_uploader import ImageUploader
                 from app.core.config import get_settings
-                
+
                 settings = get_settings()
-                
+
                 # 使用STATIC_DIR环境变量（Docker共享卷），本地回退到backend-web/static
                 _static_env = os.environ.get("STATIC_DIR", "")
                 if _static_env:
@@ -1596,19 +2532,19 @@ class XianyuAsync:
                 else:
                     # 本地源码部署：websocket -> 项目根目录 -> backend-web/static
                     static_root = Path(__file__).resolve().parent.parent.parent.parent.parent / "backend-web" / "static"
-                
+
                 # 转换URL路径为本地文件路径
                 relative_path = image_url.lstrip('/').replace('static/', '', 1)
                 local_image_path = str(static_root / relative_path)
-                
+
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】静态文件根目录: {static_root}")
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】本地图片路径: {local_image_path}")
-                
+
                 if os.path.exists(local_image_path):
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】准备上传确认收货图片到闲鱼CDN: {local_image_path}")
-                    
+
                     uploader = ImageUploader(self.cookies_str)
-                    
+
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
                         if cdn_url:
@@ -1627,30 +2563,30 @@ class XianyuAsync:
                 else:
                     # 本地文件不存在，尝试从backend-web服务下载
                     logger.info(f"[{msg_time}] 【{self.cookie_id}】本地图片不存在，尝试从backend-web服务获取...")
-                    
+
                     # 构建backend-web服务的图片URL
                     backend_web_url = settings.backend_web_service_url.rstrip('/')
                     full_image_url = f"{backend_web_url}/{image_url.lstrip('/')}"
-                    
+
                     try:
                         async with aiohttp.ClientSession() as http_session:
                             async with http_session.get(full_image_url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                                 if response.status == 200:
                                     # 下载图片到临时文件
                                     image_data = await response.read()
-                                    
+
                                     # 获取文件扩展名
                                     ext = os.path.splitext(image_url)[1] or '.png'
-                                    
+
                                     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_file:
                                         tmp_file.write(image_data)
                                         tmp_path = tmp_file.name
-                                    
+
                                     try:
                                         logger.info(f"[{msg_time}] 【{self.cookie_id}】从backend-web下载图片成功，准备上传到CDN: {tmp_path}")
-                                        
+
                                         uploader = ImageUploader(self.cookies_str)
-                                        
+
                                         async with uploader:
                                             cdn_url = await uploader.upload_image(tmp_path)
                                             if cdn_url:
@@ -1682,11 +2618,11 @@ class XianyuAsync:
                 # 其他外部链接，直接使用
                 logger.info(f"[{msg_time}] 【{self.cookie_id}】确认收货消息使用外部图片链接: {image_url}")
                 return image_url
-                
+
         except Exception as e:
             logger.error(f"[{msg_time}] 【{self.cookie_id}】处理确认收货图片失败: {e}")
             return None
-    
+
     async def send_msg(self, websocket, chat_id: str, send_user_id: str, content: str):
         """发送文本消息（参照旧框架实现）
 
@@ -1733,10 +2669,10 @@ class XianyuAsync:
                     }
                 ]
             }
-            
+
             # 打印发送参数用于调试
             logger.info(f"【{self.cookie_id}】发送文本消息: chat_id={chat_id}, to={send_user_id}, myid={self.myid}")
-            
+
             # 打印完整的WebSocket消息用于调试
             msg_str = json.dumps(msg)
             logger.info(f"【{self.cookie_id}】WebSocket发送数据长度: {len(msg_str)} 字节")
@@ -1838,11 +2774,11 @@ class XianyuAsync:
 
     def _dispatch_mid_response(self, message_data: dict) -> None:
         """将带 mid 的服务端响应分派给等待中的 Future
-        
+
         LWP 协议规则：客户端发请求时在 headers.mid 生成唯一ID，
         服务端响应时会在 headers.mid 带回同样的ID。
         用于 create_chat_conversation 等需要拿响应结果的请求。
-        
+
         Args:
             message_data: 解析后的 WebSocket 消息字典
         """
@@ -1866,19 +2802,19 @@ class XianyuAsync:
         timeout: float = 15.0,
     ) -> str:
         """创建（或获取）单聊会话，返回会话ID（chat_id）
-        
+
         通过 LWP 协议 /r/SingleChatConversation/create 请求服务端：
         - 服务端基于 (pairFirst, pairSecond, bizType) 幂等生成 cid
         - 已存在则直接返回现有 cid，不会重复创建
-        
+
         Args:
             to_user_id: 对方用户ID（买家ID，不带 @goofish 后缀）
             item_id: 关联商品ID（用作会话卡片显示）
             timeout: 等待响应超时时间（秒），默认15秒
-            
+
         Returns:
             chat_id（不带 @goofish 后缀）
-            
+
         Raises:
             ConnectionError: WebSocket 未连接
             TimeoutError: 等待响应超时
@@ -1950,17 +2886,17 @@ class XianyuAsync:
     @staticmethod
     def _extract_cid_from_create_chat_response(response: dict) -> Optional[str]:
         """从创建会话响应中提取会话ID（去掉 @goofish 后缀）
-        
+
         闲鱼 LWP 响应格式不固定，已知可能的结构：
         1) body: [{"singleChatConversation": {"cid": "xxx@goofish"}}]
         2) body: [{"singleChatUserConversation": {"singleChatConversation": {"cid": "xxx@goofish"}}}]
         3) body: [{"data": {"singleChatConversation": {"cid": "xxx@goofish"}}}]
         4) body: [{"cid": "xxx@goofish"}]  (兜底)
         5) body: {"singleChatConversation": {...}}  (body 不是数组)
-        
+
         Args:
             response: 服务端响应字典
-            
+
         Returns:
             chat_id（不带 @goofish 后缀），未找到返回 None
         """
@@ -1977,15 +2913,15 @@ class XianyuAsync:
                 first = body
             if not isinstance(first, dict):
                 return None
-            
+
             # 按优先级尝试多种嵌套结构
             conv: Optional[dict] = None
-            
+
             # 结构1: 直接 singleChatConversation
             candidate = first.get("singleChatConversation")
             if isinstance(candidate, dict):
                 conv = candidate
-            
+
             # 结构2: singleChatUserConversation.singleChatConversation（会话列表同款格式）
             if conv is None:
                 user_conv = first.get("singleChatUserConversation")
@@ -1993,7 +2929,7 @@ class XianyuAsync:
                     candidate = user_conv.get("singleChatConversation")
                     if isinstance(candidate, dict):
                         conv = candidate
-            
+
             # 结构3: data.singleChatConversation
             if conv is None:
                 data = first.get("data")
@@ -2001,11 +2937,11 @@ class XianyuAsync:
                     candidate = data.get("singleChatConversation")
                     if isinstance(candidate, dict):
                         conv = candidate
-            
+
             # 结构4: 兜底，直接从 first 找 cid 字段
             if conv is None:
                 conv = first
-            
+
             cid = conv.get("cid") or conv.get("id") or ""
             if not cid or not isinstance(cid, str):
                 return None
@@ -2018,19 +2954,19 @@ class XianyuAsync:
 
     async def _get_image_size_from_url(self, image_url: str) -> tuple:
         """从URL获取图片尺寸（参照旧框架实现）
-        
+
         Args:
             image_url: 图片URL
-            
+
         Returns:
             (width, height) 元组，失败返回 (None, None)
         """
         import aiohttp
         from io import BytesIO
-        
+
         try:
             logger.info(f"【{self.cookie_id}】开始从URL获取图片尺寸: {image_url[:80]}...")
-            
+
             # 不接受AVIF格式（PIL默认不支持），让CDN返回WEBP/JPEG等格式
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -2038,7 +2974,7 @@ class XianyuAsync:
                 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
                 'Referer': 'https://www.goofish.com/',
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(image_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
@@ -2052,16 +2988,16 @@ class XianyuAsync:
                         logger.warning(f"【{self.cookie_id}】下载图片失败，HTTP状态码: {response.status}")
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】从URL获取图片尺寸失败: {e}")
-        
+
         return (None, None)
-    
+
     async def send_image_msg(self, websocket, chat_id: str, send_user_id: str, image_url: str, card_id: int = None, keyword: str = None, default_reply_item_id = None, image_index: int = None):
         """发送图片消息（参照旧框架实现）
-        
+
         支持:
         - 闲鱼CDN链接直接发送
         - 本地图片先上传到CDN再发送
-        
+
         Args:
             websocket: WebSocket连接
             chat_id: 聊天会话ID
@@ -2080,16 +3016,16 @@ class XianyuAsync:
             import os
             from pathlib import Path
             from common.utils.xianyu_utils import generate_mid, generate_uuid
-            
+
             cdn_url = image_url
             width, height = 800, 600  # 默认尺寸
             need_get_size_from_url = False  # 标记是否需要从URL获取尺寸
-            
+
             # 检查是否是CDN链接
-            cdn_domains = ["gw.alicdn.com", "img.alicdn.com", "cloud.goofish.com", 
+            cdn_domains = ["gw.alicdn.com", "img.alicdn.com", "cloud.goofish.com",
                           "goofish.com", "taobaocdn.com", "tbcdn.cn", "aliimg.com"]
             is_cdn = any(domain in image_url.lower() for domain in cdn_domains)
-            
+
             if is_cdn:
                 # CDN链接需要从URL获取尺寸
                 logger.info(f"【{self.cookie_id}】使用已有的CDN图片链接: {image_url}")
@@ -2104,16 +3040,16 @@ class XianyuAsync:
                         static_root = Path.cwd() / static_root
                 else:
                     static_root = Path(__file__).resolve().parent.parent.parent.parent.parent / "backend-web" / "static"
-                
+
                 relative_path = image_url.lstrip('/').replace('static/', '', 1)
                 local_image_path = str(static_root / relative_path)
-                
+
                 logger.info(f"【{self.cookie_id}】静态文件根目录: {static_root}")
                 logger.info(f"【{self.cookie_id}】本地图片路径: {local_image_path}")
-                
+
                 if os.path.exists(local_image_path):
                     logger.info(f"【{self.cookie_id}】准备上传本地图片到闲鱼CDN: {local_image_path}")
-                    
+
                     # 获取本地图片尺寸
                     try:
                         from PIL import Image
@@ -2122,13 +3058,13 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】获取到本地图片尺寸: {width}x{height}")
                     except Exception as e:
                         logger.warning(f"【{self.cookie_id}】获取图片尺寸失败，使用默认尺寸: {e}")
-                    
+
                     from app.utils.image_uploader import ImageUploader
                     uploader = ImageUploader(self.cookies_str)
-                    
+
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
-                        
+
                     if not cdn_url:
                         logger.error(f"【{self.cookie_id}】图片上传到CDN失败")
                         return {
@@ -2137,9 +3073,9 @@ class XianyuAsync:
                             "image_url": image_url,
                             "error_message": "图片上传到CDN失败",
                         }
-                    
+
                     logger.info(f"【{self.cookie_id}】图片上传成功，CDN URL: {cdn_url}")
-                    
+
                     # 上传成功后更新卡券图片URL到数据库
                     if card_id:
                         try:
@@ -2154,7 +3090,7 @@ class XianyuAsync:
                                 logger.info(f"【{self.cookie_id}】已更新卡券 {card_id} 的图片URL为CDN地址")
                         except Exception as e:
                             logger.warning(f"【{self.cookie_id}】更新卡券图片URL失败: {e}")
-                    
+
                     # 上传成功后更新关键词图片URL到数据库
                     if keyword:
                         try:
@@ -2163,7 +3099,7 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】已更新关键词 '{keyword}' 的图片URL为CDN地址")
                         except Exception as e:
                             logger.warning(f"【{self.cookie_id}】更新关键词图片URL失败: {e}")
-                    
+
                     # 上传成功后更新默认回复图片URL到数据库
                     # default_reply_item_id 不为 None 时才更新（空字符串表示账号级别）
                     if default_reply_item_id is not None:
@@ -2190,7 +3126,7 @@ class XianyuAsync:
                 # 其他外部链接，尝试直接使用，需要从URL获取尺寸
                 logger.warning(f"【{self.cookie_id}】使用非CDN图片链接: {image_url}")
                 need_get_size_from_url = True
-            
+
             # 如果需要从URL获取图片尺寸（CDN链接或外部链接）
             if need_get_size_from_url:
                 try:
@@ -2200,7 +3136,7 @@ class XianyuAsync:
                         logger.info(f"【{self.cookie_id}】从URL获取到实际图片尺寸: {width}x{height}")
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】从URL获取图片尺寸失败，使用默认尺寸: {e}")
-            
+
             # 构建图片消息内容（参照旧框架，使用pics数组格式）
             msg_content = {
                 "contentType": 2,
@@ -2217,9 +3153,9 @@ class XianyuAsync:
             }
             content_json = json.dumps(msg_content, ensure_ascii=False)
             content_base64 = base64.b64encode(content_json.encode("utf-8")).decode("utf-8")
-            
+
             logger.info(f"【{self.cookie_id}】图片消息内容: {content_json}")
-            
+
             msg = {
                 "lwp": "/r/MessageSend/sendByReceiverScope",
                 "headers": {"mid": generate_mid()},
@@ -2246,10 +3182,10 @@ class XianyuAsync:
                     }
                 ]
             }
-            
+
             # 打印完整的发送消息用于调试
             logger.debug(f"【{self.cookie_id}】发送图片WebSocket消息: {json.dumps(msg, ensure_ascii=False)[:500]}...")
-            
+
             await websocket.send(json.dumps(msg))
             logger.info(f"【{self.cookie_id}】发送图片消息成功: {cdn_url}")
             return {
@@ -2266,33 +3202,33 @@ class XianyuAsync:
                 "image_url": image_url,
                 "error_message": str(e),
             }
-    
+
     async def _cancel_background_tasks(self):
         """取消并清理所有后台任务"""
         tasks_to_cancel = []
-        
+
         if self.heartbeat_task and not self.heartbeat_task.done():
             tasks_to_cancel.append(('心跳', self.heartbeat_task))
-        
+
         if self.token_refresh_task and not self.token_refresh_task.done():
             tasks_to_cancel.append(('Token刷新', self.token_refresh_task))
-        
+
         if self.cleanup_task and not self.cleanup_task.done():
             tasks_to_cancel.append(('清理', self.cleanup_task))
-        
+
         if self.cookie_refresh_task and not self.cookie_refresh_task.done():
             tasks_to_cancel.append(('Cookie刷新', self.cookie_refresh_task))
-        
+
         if tasks_to_cancel:
             logger.info(f"【{self.cookie_id}】准备取消 {len(tasks_to_cancel)} 个后台任务...")
-            
+
             for task_name, task in tasks_to_cancel:
                 try:
                     task.cancel()
                     logger.info(f"【{self.cookie_id}】已发送取消信号给{task_name}任务")
                 except Exception as e:
                     logger.error(f"【{self.cookie_id}】取消{task_name}任务失败: {e}")
-            
+
             # 等待所有任务完成取消
             for task_name, task in tasks_to_cancel:
                 try:
@@ -2303,16 +3239,16 @@ class XianyuAsync:
                     logger.info(f"【{self.cookie_id}】{task_name}任务已取消")
                 except Exception as e:
                     logger.error(f"【{self.cookie_id}】{task_name}任务取消异常: {e}")
-            
+
             logger.info(f"【{self.cookie_id}】所有后台任务已处理完成")
-    
+
     async def main(self):
         """主程序入口"""
         try:
             logger.info(f"【{self.cookie_id}】开始启动XianyuAsync主程序...")
             await self.create_session()
             logger.info(f"【{self.cookie_id}】Session创建完成,开始WebSocket连接循环...")
-            
+
             while True:
                 try:
                     runtime_state = await self._load_runtime_account_state()
@@ -2384,10 +3320,10 @@ class XianyuAsync:
                         )
                         await self.close_session()
                         await self.create_session()
-                    
+
                     headers = WEBSOCKET_HEADERS.copy()
                     headers['Cookie'] = self.cookies_str.replace('\n', '').replace('\r', '') if self.cookies_str else ''
-                    
+
                     # 在WebSocket连接之前获取Token（确保Token有效）
                     if not self.current_token:
                         logger.info(f"【{self.cookie_id}】WebSocket连接前获取Token...")
@@ -2447,26 +3383,26 @@ class XianyuAsync:
                         # Token获取成功，重置失败计数
                         if hasattr(self, '_token_fetch_failures'):
                             self._token_fetch_failures = 0
-                    
+
                     # 更新连接状态
                     self.connection_manager.set_connection_state(
-                        ConnectionState.CONNECTING, 
+                        ConnectionState.CONNECTING,
                         "准备建立WebSocket连接"
                     )
                     # 记录本次连接尝试的开始时间（用于判断是连接建立阶段超时还是连接成功后断开）
                     self._connection_attempt_start_time = time.time()
                     logger.info(f"【{self.cookie_id}】WebSocket目标地址: {self.base_url}")
-                    
+
                     # 创建WebSocket连接
                     async with await self.connection_manager.create_websocket_connection(headers) as websocket:
                         self.connection_manager.ws = websocket
                         logger.info(f"【{self.cookie_id}】WebSocket连接建立成功,开始初始化...")
-                        
+
                         try:
                             # 初始化连接
                             await self.init(websocket)
                             logger.info(f"【{self.cookie_id}】WebSocket初始化完成!")
-                            
+
                             # 更新连接状态
                             self.connection_manager.set_connection_state(
                                 ConnectionState.CONNECTED,
@@ -2476,10 +3412,10 @@ class XianyuAsync:
                             self.connection_manager.network_failures = 0  # 成功连接后重置网络错误计数
                             self.connection_manager.last_successful_connection = time.time()
                             self._connection_start_time = time.time()  # 记录连接开始时间
-                            
+
                             # 启动后台任务
                             logger.info(f"【{self.cookie_id}】启动后台任务...")
-                            
+
                             # 如果存在旧的心跳任务，先清理（心跳任务依赖WebSocket，必须重启）
                             if self.heartbeat_task:
                                 logger.warning(f"【{self.cookie_id}】检测到旧心跳任务引用，先清理...")
@@ -2490,25 +3426,25 @@ class XianyuAsync:
                                     except Exception as e:
                                         logger.warning(f"【{self.cookie_id}】取消旧心跳任务失败: {e}")
                                 self.heartbeat_task = None
-                            
+
                             # 启动心跳任务
                             logger.info(f"【{self.cookie_id}】启动心跳任务...")
                             self.heartbeat_task = asyncio.create_task(
                                 self.connection_manager.heartbeat_loop(websocket)
                             )
-                            
+
                             # 启动Token刷新任务
                             if not self.token_refresh_task or self.token_refresh_task.done():
                                 self.token_refresh_task = asyncio.create_task(
                                     self.token_manager.token_refresh_loop()
                                 )
-                            
+
                             # 启动清理任务
                             if not self.cleanup_task or self.cleanup_task.done():
                                 self.cleanup_task = asyncio.create_task(
                                     self.pause_cleanup_loop()
                                 )
-                            
+
                             # 启动Cookie刷新任务
                             if not self.cookie_refresh_task or self.cookie_refresh_task.done():
                                 logger.info(f"【{self.cookie_id}】启动Cookie刷新任务...")
@@ -2517,43 +3453,43 @@ class XianyuAsync:
                                 )
                             else:
                                 logger.info(f"【{self.cookie_id}】Cookie刷新任务已在运行，跳过启动")
-                            
+
                             logger.info(f"【{self.cookie_id}】所有后台任务已启动")
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
-                            
+
                             # 消息循环
                             async for message in websocket:
                                 logger.debug(f"【{self.cookie_id}】收到消息: {len(message) if message else 0} 字节")
                                 try:
                                     message_data = json.loads(message)
-                                    
+
                                     # 处理心跳响应
                                     if self.connection_manager.handle_heartbeat_response(message_data):
                                         continue
-                                    
+
                                     # 处理LWP请求-响应关联：如果响应的mid命中等待队列，
                                     # resolve对应Future（用于 create_chat 等需要等待结果的请求）
                                     self._dispatch_mid_response(message_data)
-                                    
+
                                     # 处理其他消息
                                     # 使用追踪的异步任务处理消息，防止阻塞后续消息接收
                                     # 并通过信号量控制并发数量，防止内存泄漏
                                     self._create_tracked_task(self._handle_message_with_semaphore(message_data, websocket))
-                                    
+
                                 except Exception as e:
                                     logger.error(f"【{self.cookie_id}】处理消息出错: {e}")
                                     continue
-                        
+
                         finally:
                             # 清理WebSocket引用
                             if self.connection_manager.ws == websocket:
                                 self.connection_manager.ws = None
                                 logger.info(f"【{self.cookie_id}】WebSocket连接已退出")
-                
+
                 except Exception as e:
                     error_msg = str(e)
                     error_type = type(e).__name__
-                    
+
                     # 检查是否是网络类型错误
                     is_network_type_error = (
                         'ConnectionClosedError' in error_type or
@@ -2563,10 +3499,10 @@ class XianyuAsync:
                         'TimeoutError' in error_type or
                         'connection reset' in error_msg.lower()
                     )
-                    
+
                     # 计算本次连接尝试的持续时间（从开始尝试连接到出错）
                     attempt_duration = time.time() - getattr(self, '_connection_attempt_start_time', time.time())
-                    
+
                     # 判断是否曾经成功连接过：检查连接成功后的持续时间
                     # _connection_start_time 是在连接成功并初始化完成后才设置的
                     connection_success_time = getattr(self, '_connection_start_time', 0)
@@ -2574,16 +3510,16 @@ class XianyuAsync:
                     was_connected = connection_success_time > getattr(self, '_connection_attempt_start_time', 0)
                     # 连接成功后的持续时间
                     connected_duration = time.time() - connection_success_time if was_connected else 0
-                    
+
                     # 清理WebSocket引用
                     if self.connection_manager.ws:
                         self.connection_manager.ws = None
-                    
+
                     if is_network_type_error and was_connected:
                         # 纯网络错误：连接已经正常工作过，只是网络断开
                         self.connection_manager.network_failures += 1
                         logger.warning(f"【{self.cookie_id}】网络连接断开(第{self.connection_manager.network_failures}次，已连接{connected_duration:.1f}秒): {error_type}")
-                        
+
                         # 检测是否频繁短连接断开
                         if self.connection_manager.record_short_disconnect(connected_duration):
                             # 频繁短连接断开，禁用账号
@@ -2595,12 +3531,12 @@ class XianyuAsync:
                             except Exception as e:
                                 logger.error(f"【{self.cookie_id}】禁用账号失败: {e}")
                             break
-                        
+
                         self.connection_manager.set_connection_state(
                             ConnectionState.RECONNECTING,
                             f"网络断开第{self.connection_manager.network_failures}次"
                         )
-                        
+
                         # 网络错误阈值更宽松，不会导致禁用账号
                         if self.connection_manager.network_failures >= self.connection_manager.max_network_failures:
                             logger.warning(f"【{self.cookie_id}】网络连续断开{self.connection_manager.max_network_failures}次，等待较长时间后重试")
@@ -2612,18 +3548,18 @@ class XianyuAsync:
                             retry_delay = self.connection_manager.calculate_network_retry_delay()
                             logger.info(f"【{self.cookie_id}】将在 {retry_delay} 秒后重试...")
                             await self._interruptible_sleep(retry_delay)
-                        
+
                         continue
-                    
+
                     # 认证/Token相关失败：连接很快就断开或无法建立
                     self.connection_manager.connection_failures += 1
                     self.connection_manager.set_connection_state(
                         ConnectionState.RECONNECTING,
                         f"第{self.connection_manager.connection_failures}次失败"
                     )
-                    
+
                     logger.warning(f"【{self.cookie_id}】连接失败(尝试{attempt_duration:.1f}秒): {error_type} - {error_msg}")
-                    
+
                     # 如果连接尝试时间较短（15秒内失败），说明可能是Token无效，清除缓存
                     if attempt_duration < 15 and self._cookie_token_manager:
                         logger.warning(f"【{self.cookie_id}】连接尝试{attempt_duration:.1f}秒后失败，Token可能无效，清除缓存...")
@@ -2632,11 +3568,11 @@ class XianyuAsync:
                             logger.info(f"【{self.cookie_id}】Token缓存已清除")
                         except Exception as e:
                             logger.error(f"【{self.cookie_id}】清除Token缓存失败: {e}")
-                    
+
                     # 检查是否超过最大失败次数
                     if self.connection_manager.connection_failures >= self.connection_manager.max_connection_failures:
                         logger.error(f"【{self.cookie_id}】认证相关连续失败{self.connection_manager.max_connection_failures}次")
-                        
+
                         # 尝试密码登录刷新
                         # try_password_login_refresh 的返回值契约（与 cookie_token_manager.py 内部
                         # 递归调用、internal.py 中 API 调用保持一致）：
@@ -2665,33 +3601,33 @@ class XianyuAsync:
                                 logger.warning(f"【{self.cookie_id}】CookieTokenManager未初始化")
                         except Exception as e:
                             logger.error(f"【{self.cookie_id}】密码登录异常: {e}")
-                        
+
                         break
-                    
+
                     # 计算重试延迟
                     retry_delay = self.connection_manager.calculate_retry_delay(error_msg)
                     logger.warning(f"【{self.cookie_id}】将在 {retry_delay} 秒后重试...")
-                    
+
                     # 清空token（内存）
                     if self.current_token:
                         self.current_token = None
-                    
+
                     # 等待后重试
                     await self._interruptible_sleep(retry_delay)
                     logger.info(f"【{self.cookie_id}】开始新一轮连接尝试...")
                     continue
-        
+
         finally:
             # 更新连接状态
             self.connection_manager.set_connection_state(ConnectionState.CLOSED, "程序退出")
-            
+
             # 清理后台任务
             logger.info(f"【{self.cookie_id}】清理后台任务...")
             await self._cancel_background_tasks()
-            
+
             # 关闭session
             await self.close_session()
-            
+
             # 注销实例
             self._unregister_instance()
             logger.info(f"【{self.cookie_id}】XianyuAsync主程序已完全退出")

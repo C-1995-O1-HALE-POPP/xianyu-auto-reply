@@ -30,6 +30,8 @@ from . import (
     chat_quick_phrase,
     chat_customer_order,
     payment,
+    order_price_adjustments,
+    purchase_actions,
     confirm_receipt_messages,
     api_cookie_renew_logs,
     cookie_refresh,
@@ -98,6 +100,8 @@ api_router.include_router(cookies.router, prefix="/cookies", tags=["账号管理
 # 商品和订单
 api_router.include_router(items.items_router, tags=["商品管理"])  # items.py已定义prefix="/items"
 api_router.include_router(orders.router, prefix="/orders", tags=["订单管理"])
+api_router.include_router(purchase_actions.router, prefix="/purchase-actions", tags=["订单阶段回复"])
+api_router.include_router(order_price_adjustments.router, prefix="/order-price-adjustments", tags=["订单自动改价"])
 api_router.include_router(product_publish.router, tags=["商品发布"])  # 已定义prefix="/product-publish"
 api_router.include_router(publish_addresses.router, tags=["商品发布随机地址池"])  # 已定义prefix="/product-publish/addresses"
 api_router.include_router(personal_addresses.router, tags=["个人发布地址库"])  # 已定义prefix="/product-publish/personal-addresses"

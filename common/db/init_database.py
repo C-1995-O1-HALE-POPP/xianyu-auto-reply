@@ -539,6 +539,97 @@ class DatabaseInitializer:
                 INDEX idx_account_item_user (account_id, item_id, user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='默认回复记录表';
         """,
+
+        # 11.1 订单阶段自动回复配置表
+        "xy_purchase_actions": """
+            CREATE TABLE IF NOT EXISTS xy_purchase_actions (
+                id INT PRIMARY KEY AUTO_INCREMENT COMMENT '配置ID',
+                owner_id INT NOT NULL DEFAULT 0 COMMENT '所属系统用户ID',
+                account_id VARCHAR(80) NOT NULL COMMENT '账号标识',
+                item_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT '商品ID',
+                stage VARCHAR(16) NOT NULL DEFAULT 'purchase' COMMENT '订单阶段：purchase-拍下，paid-付款',
+                enabled TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否启用',
+                action_type VARCHAR(16) NOT NULL DEFAULT 'message' COMMENT '动作类型：message-文本，api-接口',
+                message_template TEXT COMMENT '回复内容模板',
+                reply_image VARCHAR(512) COMMENT '回复图片URL',
+                api_url VARCHAR(1024) COMMENT 'API地址',
+                api_method VARCHAR(8) NOT NULL DEFAULT 'POST' COMMENT 'API请求方法',
+                api_timeout INT NOT NULL DEFAULT 80 COMMENT 'API超时时间(秒)',
+                api_params TEXT COMMENT '兼容旧版API参数(JSON)',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_pa_account_stage (account_id, stage),
+                INDEX idx_pa_account_item_stage (account_id, item_id, stage),
+                UNIQUE KEY uq_purchase_action_account_item_stage (account_id, item_id, stage)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单阶段自动回复配置表';
+        """,
+
+        # 11.2 订单阶段自动回复发送记录表
+        "xy_order_stage_reply_records": """
+            CREATE TABLE IF NOT EXISTS xy_order_stage_reply_records (
+                id INT PRIMARY KEY AUTO_INCREMENT COMMENT '记录ID',
+                owner_id INT NOT NULL DEFAULT 0 COMMENT '所属系统用户ID',
+                account_id VARCHAR(80) NOT NULL COMMENT '账号标识',
+                item_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT '商品ID',
+                stage VARCHAR(16) NOT NULL COMMENT '订单阶段：purchase-拍下，paid-付款',
+                order_no VARCHAR(64) NOT NULL COMMENT '订单号',
+                buyer_id VARCHAR(64) DEFAULT NULL COMMENT '买家ID',
+                chat_id VARCHAR(64) DEFAULT NULL COMMENT '聊天会话ID',
+                reply_text TEXT COMMENT '发送文本',
+                reply_image VARCHAR(512) COMMENT '发送图片',
+                send_status VARCHAR(20) NOT NULL DEFAULT 'success' COMMENT '发送状态',
+                send_result TEXT COMMENT '发送结果快照',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                INDEX idx_osrr_account_stage (account_id, stage),
+                INDEX idx_osrr_order_no (order_no),
+                UNIQUE KEY uq_order_stage_reply_account_stage_order (account_id, stage, order_no)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单阶段自动回复发送记录表';
+        """,
+
+        # 11.3 订单拍下后自动改价配置表
+        "xy_order_price_adjustments": """
+            CREATE TABLE IF NOT EXISTS xy_order_price_adjustments (
+                id INT PRIMARY KEY AUTO_INCREMENT COMMENT '配置ID',
+                owner_id INT NOT NULL DEFAULT 0 COMMENT '所属系统用户ID',
+                account_id VARCHAR(80) NOT NULL COMMENT '账号标识',
+                item_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT '商品ID',
+                enabled TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否启用',
+                target_item_price VARCHAR(32) NOT NULL DEFAULT '0.00' COMMENT '改后商品总价(元)',
+                target_post_fee VARCHAR(32) NOT NULL DEFAULT '0.00' COMMENT '改后邮费(元)',
+                override_url VARCHAR(1024) DEFAULT NULL COMMENT '外部API/WS改价地址',
+                override_timeout INT NOT NULL DEFAULT 10 COMMENT '外部接口超时时间(秒)',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_opa_account_item (account_id, item_id),
+                UNIQUE KEY uq_order_price_adjust_account_item (account_id, item_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单拍下后自动改价配置表';
+        """,
+
+        # 11.4 订单自动改价执行记录表
+        "xy_order_price_adjust_records": """
+            CREATE TABLE IF NOT EXISTS xy_order_price_adjust_records (
+                id INT PRIMARY KEY AUTO_INCREMENT COMMENT '记录ID',
+                owner_id INT NOT NULL DEFAULT 0 COMMENT '所属系统用户ID',
+                account_id VARCHAR(80) NOT NULL COMMENT '账号标识',
+                item_id VARCHAR(64) NOT NULL DEFAULT '' COMMENT '商品ID',
+                order_no VARCHAR(64) NOT NULL COMMENT '订单号',
+                buyer_id VARCHAR(64) DEFAULT NULL COMMENT '买家ID',
+                chat_id VARCHAR(64) DEFAULT NULL COMMENT '聊天会话ID',
+                target_item_price VARCHAR(32) DEFAULT NULL COMMENT '目标商品总价(元)',
+                target_post_fee VARCHAR(32) DEFAULT NULL COMMENT '目标邮费(元)',
+                original_item_price VARCHAR(32) DEFAULT NULL COMMENT '原商品总价(元)',
+                original_post_fee VARCHAR(32) DEFAULT NULL COMMENT '原邮费(元)',
+                original_total_price VARCHAR(32) DEFAULT NULL COMMENT '原订单总价(元)',
+                result_status VARCHAR(20) NOT NULL DEFAULT 'failed' COMMENT '执行状态：success/failed/skipped',
+                result_message TEXT COMMENT '执行结果描述',
+                ret TEXT COMMENT '闲鱼接口返回ret',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+                INDEX idx_opar_account_item (account_id, item_id),
+                INDEX idx_opar_order_no (order_no),
+                UNIQUE KEY uq_order_price_adjust_account_order (account_id, order_no)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='订单自动改价执行记录表';
+        """,
         
         # 12. AI聊天消息表
         "xy_ai_chat_messages": """
@@ -1734,6 +1825,26 @@ class DatabaseInitializer:
         ],
         "xy_default_reply_records": [
             ("item_id", "VARCHAR(64) DEFAULT NULL COMMENT '商品ID'", "account_id"),
+        ],
+        "xy_purchase_actions": [
+            ("stage", "VARCHAR(16) NOT NULL DEFAULT 'purchase' COMMENT '订单阶段：purchase-拍下，paid-付款'", "item_id"),
+            ("reply_image", "VARCHAR(512) COMMENT '回复图片URL'", "message_template"),
+        ],
+        "xy_order_price_adjustments": [
+            ("override_url", "VARCHAR(1024) DEFAULT NULL COMMENT '外部API/WS改价地址'", "target_post_fee"),
+            ("override_timeout", "INT NOT NULL DEFAULT 10 COMMENT '外部接口超时时间(秒)'", "override_url"),
+        ],
+        "xy_order_price_adjust_records": [
+            ("buyer_id", "VARCHAR(64) DEFAULT NULL COMMENT '买家ID'", "order_no"),
+            ("chat_id", "VARCHAR(64) DEFAULT NULL COMMENT '聊天会话ID'", "buyer_id"),
+            ("target_item_price", "VARCHAR(32) DEFAULT NULL COMMENT '目标商品总价(元)'", "chat_id"),
+            ("target_post_fee", "VARCHAR(32) DEFAULT NULL COMMENT '目标邮费(元)'", "target_item_price"),
+            ("original_item_price", "VARCHAR(32) DEFAULT NULL COMMENT '原商品总价(元)'", "target_post_fee"),
+            ("original_post_fee", "VARCHAR(32) DEFAULT NULL COMMENT '原邮费(元)'", "original_item_price"),
+            ("original_total_price", "VARCHAR(32) DEFAULT NULL COMMENT '原订单总价(元)'", "original_post_fee"),
+            ("result_status", "VARCHAR(20) NOT NULL DEFAULT 'failed' COMMENT '执行状态：success/failed/skipped'", "original_total_price"),
+            ("result_message", "TEXT COMMENT '执行结果描述'", "result_status"),
+            ("ret", "TEXT COMMENT '闲鱼接口返回ret'", "result_message"),
         ],
         "xy_catalog_items": [
             ("ai_prompt", "TEXT COMMENT '商品AI提示词'", "price"),
