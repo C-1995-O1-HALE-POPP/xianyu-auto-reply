@@ -221,6 +221,75 @@ bash build_websocket.sh     # 重建 WebSocket
 bash build_scheduler.sh     # 重建 Scheduler
 ```
 
+### 外部订单改价 API
+
+系统支持对已同步到本地数据库、且状态为待付款的闲鱼订单发起直接改价。该接口会由 `backend-web` 校验登录用户、账号归属、订单状态和商品 ID，再转发到 `websocket` 服务复用当前账号 Cookie 执行卖家端 mtop 改价请求，并把执行结果写入 `xy_order_price_adjust_records`。
+
+接口地址：
+
+```http
+POST /api/v1/order-price-adjustments/{account_id}/orders/{order_no}/adjust
+Authorization: Bearer <access_token>
+Content-Type: application/json
+```
+
+请求体：
+
+```json
+{
+  "item_id": "1061014864984",
+  "target_item_price": "5.00",
+  "target_post_fee": "0.00",
+  "initial_delay_seconds": 0
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `item_id` | 否 | 商品 ID；为空时使用订单记录里的商品 ID；如果传入且与订单不一致会拒绝 |
+| `target_item_price` | 是 | 改后商品总价，单位元，必须大于 0，保存为两位小数 |
+| `target_post_fee` | 否 | 改后邮费，单位元，默认 `0.00`，允许为 0 |
+| `initial_delay_seconds` | 否 | 本次调用前等待秒数，范围 0-120；外部直接调用通常填 0 |
+
+示例：
+
+```bash
+curl -X POST "http://服务器IP:8089/api/v1/order-price-adjustments/2208795510957/orders/3309994095687011084/adjust" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "item_id": "1061014864984",
+    "target_item_price": "5.00",
+    "target_post_fee": "0.00",
+    "initial_delay_seconds": 0
+  }'
+```
+
+成功响应示例：
+
+```json
+{
+  "success": true,
+  "message": "价格修改成功(pc)",
+  "data": {
+    "account_id": "2208795510957",
+    "order_no": "3309994095687011084",
+    "item_id": "1061014864984",
+    "target_item_price": "5.00",
+    "target_post_fee": "0.00",
+    "websocket_result": {
+      "success": true,
+      "code": 200,
+      "message": "价格修改成功(pc)"
+    }
+  }
+}
+```
+
+自动拍下触发的改价默认会先等待 `ORDER_PRICE_ADJUST_INITIAL_DELAY_SECONDS` 秒再提交，默认值为 `12`。这是为了避开订单刚生成时平台暂不允许改价的窗口；外部直接改价接口可以用请求体的 `initial_delay_seconds` 针对单次调用覆盖。
+
 ### 方式四：源码本地开发
 
 #### 1. 准备基础服务

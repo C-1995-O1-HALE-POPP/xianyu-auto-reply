@@ -58,6 +58,15 @@ class CancelOrderRequest(BaseModel):
     order_no: str
 
 
+class AdjustOrderPriceRequest(BaseModel):
+    account_id: str
+    order_no: str
+    item_id: str = ""
+    target_item_price: str
+    target_post_fee: str = "0.00"
+    initial_delay_seconds: int = 0
+
+
 class CreateChatRequest(BaseModel):
     """创建单聊会话请求
     
@@ -656,6 +665,36 @@ async def cancel_order(request: CancelOrderRequest):
         )
         await session.commit()
     return {"success": True, "code": 200, "message": "订单已取消", "data": {"order_no": request.order_no}}
+
+
+@router.post("/orders/adjust-price")
+async def adjust_order_price(request: AdjustOrderPriceRequest):
+    """按订单号直接执行待付款订单改价。"""
+    from app.services.xianyu.cookie_manager import get_manager
+    from loguru import logger
+
+    xianyu_live = get_manager().instances.get(request.account_id)
+    if not xianyu_live:
+        return {"success": False, "code": 404, "message": "账号未连接", "data": None}
+
+    result = await xianyu_live.adjust_order_price(
+        order_no=request.order_no,
+        item_id=request.item_id,
+        target_item_price=request.target_item_price,
+        target_post_fee=request.target_post_fee,
+        initial_delay_seconds=request.initial_delay_seconds,
+    )
+    status_code = 200 if result.get("success") else 400
+    logger.info(
+        f"【内部API】订单改价完成: account_id={request.account_id}, "
+        f"order_no={request.order_no}, success={result.get('success')}, message={result.get('message')}"
+    )
+    return {
+        "success": bool(result.get("success")),
+        "code": status_code,
+        "message": result.get("message") or ("订单改价成功" if result.get("success") else "订单改价失败"),
+        "data": result,
+    }
 
 
 @router.post("/orders/deliver")

@@ -1492,6 +1492,7 @@ class XianyuAsync:
         item_id: str,
         target_item_price: str,
         target_post_fee: str,
+        initial_delay_seconds: int | None = None,
     ) -> dict:
         """复刻卖家工作台 mtop：先取改价页数据，再提交改后商品总价/邮费。"""
         if not order_no:
@@ -1501,7 +1502,11 @@ class XianyuAsync:
         if not target_item_price or target_post_fee is None:
             return {"success": False, "message": "目标价格非法"}
 
-        initial_delay = self._get_order_price_adjust_initial_delay()
+        initial_delay = (
+            self._get_order_price_adjust_initial_delay()
+            if initial_delay_seconds is None
+            else max(0, min(int(initial_delay_seconds or 0), 120))
+        )
         if initial_delay > 0:
             logger.info(f"【{self.cookie_id}】自动改价：等待{initial_delay}秒后提交改价 order_id={order_no}")
             await asyncio.sleep(initial_delay)
