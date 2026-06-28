@@ -80,7 +80,7 @@ async def update_default_reply(
     if not account:
         raise HTTPException(status_code=404, detail="账号不存在")
 
-    # API 类型需校验地址合法性（防 SSRF）
+    # API 类型需校验地址基本格式
     api_timeout = normalize_api_timeout(reply_data.api_timeout)
     if reply_data.reply_type == "api":
         valid, err = validate_api_url(reply_data.api_url)

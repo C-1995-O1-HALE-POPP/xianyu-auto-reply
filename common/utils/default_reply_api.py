@@ -1,15 +1,13 @@
 """默认回复 API 类型公共工具
 
 职责（被后端保存校验、websocket 运行时调用共同复用，避免重复实现）：
-1. 校验用户填写的 API 地址合法性，并防范 SSRF（禁止指向内网/回环地址）。
+1. 校验用户填写的 API 地址基本格式是否合法。
 2. 调用外部 API（POST），将消息内容传给对方接口。
 3. 解析对方返回内容：兼容 JSON（{"reply": "..."} / {"success", "reply"}）与纯文本两种格式。
 """
 from __future__ import annotations
 
-import ipaddress
 import json
-import socket
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -24,7 +22,7 @@ MAX_API_TIMEOUT = 120
 
 
 def validate_api_url(api_url: str) -> Tuple[bool, str]:
-    """校验默认回复 API 地址是否合法且安全（防 SSRF）。
+    """校验默认回复 API 地址基本格式是否合法。
 
     Args:
         api_url: 用户填写的 API 地址
@@ -45,30 +43,6 @@ def validate_api_url(api_url: str) -> Tuple[bool, str]:
     host = parsed.hostname
     if not host:
         return False, "API地址缺少主机名"
-
-    # 解析主机名对应的所有 IP，逐个校验是否为内网/回环/保留地址
-    try:
-        addr_infos = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        # 域名无法解析：保存阶段不强制拦截（可能保存时网络不可达），
-        # 真正调用时再行兜底处理。但格式本身合法，放行。
-        return True, ""
-
-    for info in addr_infos:
-        ip_str = info[4][0]
-        try:
-            ip_obj = ipaddress.ip_address(ip_str)
-        except ValueError:
-            continue
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_reserved
-            or ip_obj.is_multicast
-            or ip_obj.is_unspecified
-        ):
-            return False, "API地址不允许指向内网或回环地址"
 
     return True, ""
 
@@ -170,19 +144,7 @@ async def call_reply_api(
     try:
         client_timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
-            # 禁止自动跟随重定向：防止外部域名通过 30x 跳转到内网/回环地址
-            # （如云元数据 169.254.169.254）绕过保存时的 SSRF 地址校验。
-            async with session.post(
-                api_url.strip(), json=payload, allow_redirects=False
-            ) as response:
-                # 命中重定向直接视为非法响应，不发送任何回复
-                if response.status in (301, 302, 303, 307, 308):
-                    location = response.headers.get("Location", "")
-                    logger.warning(
-                        f"【{account_id}】默认回复API返回重定向({response.status})，"
-                        f"为防 SSRF 已拒绝跟随: {location}"
-                    )
-                    return None
+            async with session.post(api_url.strip(), json=payload) as response:
                 body_text = await response.text()
                 reply = parse_api_reply(response.status, body_text)
                 if reply:

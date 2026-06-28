@@ -249,7 +249,7 @@ async def save_item_default_reply(
     if not account:
         return ApiResponse(success=False, message="账号不存在")
     
-    # API 类型需校验地址合法性（防 SSRF）
+    # API 类型需校验地址基本格式
     api_timeout = normalize_api_timeout(payload.api_timeout)
     if payload.reply_type == "api":
         valid, err = validate_api_url(payload.api_url)
@@ -410,7 +410,7 @@ async def batch_save_item_default_reply(
     if not payload.item_ids:
         return ApiResponse(success=False, message="请选择至少一个商品")
 
-    # API 类型需校验地址合法性（防 SSRF）
+    # API 类型需校验地址基本格式
     api_timeout = normalize_api_timeout(payload.api_timeout)
     if payload.reply_type == "api":
         valid, err = validate_api_url(payload.api_url)
